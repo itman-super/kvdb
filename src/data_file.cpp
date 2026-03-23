@@ -6,26 +6,25 @@
 
 namespace {
 
-// 文件记录的 magic number，用于快速识别记录是否合法
-constexpr uint32_t kMagic = 0x4B564442;  // "KVDB"
+// 新的 magic，可以和旧版本区分。
+// 如果你不想改 magic，也可以保持原值，但旧数据文件将无法兼容。
+constexpr uint32_t kMagic = 0x4B564443;  // "KVDC"
 
-// 第一版记录头布局：
-// magic(4) + type(1) + timestamp(8) + key_size(4) + value_size(4)
+// 记录头布局：
+// magic(4) + type(1) + timestamp(8) + key_size(4) + value_size(4) + crc(4)
 constexpr std::size_t kHeaderSize =
     sizeof(uint32_t) +   // magic
     sizeof(uint8_t) +    // type
     sizeof(uint64_t) +   // timestamp
     sizeof(uint32_t) +   // key_size
-    sizeof(uint32_t);    // value_size
+    sizeof(uint32_t) +   // value_size
+    sizeof(uint32_t);    // crc
 
-// 将一个定长类型追加到字符串末尾
-// 这里直接按内存字节布局写入，第一版默认本机读写，不处理跨平台字节序问题
 template <typename T>
 void AppendFixed(std::string* out, const T& value) {
     out->append(reinterpret_cast<const char*>(&value), sizeof(T));
 }
 
-// 从 buf 的当前位置读取一个定长类型，并推进 pos
 template <typename T>
 bool ReadFixed(const std::string& buf, std::size_t* pos, T* value) {
     if (*pos + sizeof(T) > buf.size()) {
@@ -34,6 +33,50 @@ bool ReadFixed(const std::string& buf, std::size_t* pos, T* value) {
     std::memcpy(value, buf.data() + *pos, sizeof(T));
     *pos += sizeof(T);
     return true;
+}
+
+// CRC32 实现（无外部依赖）
+uint32_t CRC32Update(uint32_t crc, const char* data, std::size_t len) {
+    crc = ~crc;
+    for (std::size_t i = 0; i < len; ++i) {
+        crc ^= static_cast<uint8_t>(data[i]);
+        for (int j = 0; j < 8; ++j) {
+            if (crc & 1U) {
+                crc = (crc >> 1U) ^ 0xEDB88320U;
+            } else {
+                crc >>= 1U;
+            }
+        }
+    }
+    return ~crc;
+}
+
+template <typename T>
+uint32_t CRC32UpdateFixed(uint32_t crc, const T& value) {
+    return CRC32Update(crc, reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+// 计算一条记录的 CRC：
+// 覆盖 type | timestamp | key_size | value_size | key | value
+uint32_t ComputeRecordCRC(uint8_t type,
+                          uint64_t timestamp,
+                          uint32_t key_size,
+                          uint32_t value_size,
+                          const char* key_data,
+                          const char* value_data) {
+    uint32_t crc = 0;
+    crc = CRC32UpdateFixed(crc, type);
+    crc = CRC32UpdateFixed(crc, timestamp);
+    crc = CRC32UpdateFixed(crc, key_size);
+    crc = CRC32UpdateFixed(crc, value_size);
+
+    if (key_size > 0) {
+        crc = CRC32Update(crc, key_data, key_size);
+    }
+    if (value_size > 0) {
+        crc = CRC32Update(crc, value_data, value_size);
+    }
+    return crc;
 }
 
 }  // namespace
@@ -48,13 +91,10 @@ DataFile::~DataFile() {
 Status DataFile::Open(bool writable) {
     writable_ = writable;
 
-    // 避免重复打开
     if (file_.is_open()) {
         return Status::OK();
     }
 
-    // 第一版以二进制方式打开
-    // 读取必须支持；如果 writable=true，则同时支持写
     std::ios::openmode mode = std::ios::binary | std::ios::in;
     if (writable_) {
         mode |= std::ios::out;
@@ -62,7 +102,6 @@ Status DataFile::Open(bool writable) {
 
     file_.open(file_path_, mode);
 
-    // 如果文件不存在且可写，则先创建后再打开
     if (!file_.is_open() && writable_) {
         std::ofstream create(file_path_, std::ios::binary | std::ios::out);
         create.close();
@@ -89,8 +128,6 @@ Status DataFile::Sync() {
         return Status::IOError("file not open");
     }
 
-    // 第一版先用 flush
-    // 若后续要增强 crash consistency，需要补真正的 fsync/fdatasync
     file_.flush();
     if (!file_) {
         return Status::IOError("flush failed");
@@ -103,7 +140,6 @@ uint64_t DataFile::Size() {
         return 0;
     }
 
-    // 清除状态位，防止上次 EOF 或 fail 状态影响 seek
     file_.clear();
     file_.seekg(0, std::ios::end);
     return static_cast<uint64_t>(file_.tellg());
@@ -126,7 +162,6 @@ Status DataFile::ReadBytes(uint64_t offset, char* data, std::size_t len) {
         return Status::IOError("file not open");
     }
 
-    // 先 clear，再 seekg，是 fstream 读写混用时很关键的习惯
     file_.clear();
     file_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     if (!file_) {
@@ -151,14 +186,21 @@ std::string DataFile::EncodeRecord(const LogRecord& record) {
     const uint32_t key_size = static_cast<uint32_t>(record.key.size());
     const uint32_t value_size = static_cast<uint32_t>(record.value.size());
 
-    // 固定头
+    const uint32_t crc = ComputeRecordCRC(
+        type,
+        timestamp,
+        key_size,
+        value_size,
+        record.key.data(),
+        record.value.data()
+    );
+
     AppendFixed(&out, magic);
     AppendFixed(&out, type);
     AppendFixed(&out, timestamp);
     AppendFixed(&out, key_size);
     AppendFixed(&out, value_size);
-
-    // 变长 body
+    AppendFixed(&out, crc);
     out.append(record.key);
     out.append(record.value);
 
@@ -176,13 +218,14 @@ Status DataFile::DecodeRecord(const std::string& buf, LogRecord* record) {
     uint64_t timestamp = 0;
     uint32_t key_size = 0;
     uint32_t value_size = 0;
+    uint32_t stored_crc = 0;
 
-    // 依次读取头部字段
     if (!ReadFixed(buf, &pos, &magic) ||
         !ReadFixed(buf, &pos, &type) ||
         !ReadFixed(buf, &pos, &timestamp) ||
         !ReadFixed(buf, &pos, &key_size) ||
-        !ReadFixed(buf, &pos, &value_size)) {
+        !ReadFixed(buf, &pos, &value_size) ||
+        !ReadFixed(buf, &pos, &stored_crc)) {
         return Status::Corruption("bad record header");
     }
 
@@ -190,16 +233,30 @@ Status DataFile::DecodeRecord(const std::string& buf, LogRecord* record) {
         return Status::Corruption("bad magic");
     }
 
-    // 校验总长度是否匹配
     if (buf.size() != kHeaderSize + key_size + value_size) {
         return Status::Corruption("record size mismatch");
     }
 
+    const char* key_ptr = buf.data() + pos;
+    const char* value_ptr = key_ptr + key_size;
+
+    const uint32_t actual_crc = ComputeRecordCRC(
+        type,
+        timestamp,
+        key_size,
+        value_size,
+        key_ptr,
+        value_ptr
+    );
+
+    if (actual_crc != stored_crc) {
+        return Status::Corruption("crc mismatch");
+    }
+
     record->type = static_cast<RecordType>(type);
     record->timestamp = timestamp;
-    record->key.assign(buf.data() + pos, key_size);
-    pos += key_size;
-    record->value.assign(buf.data() + pos, value_size);
+    record->key.assign(key_ptr, key_size);
+    record->value.assign(value_ptr, value_size);
 
     return Status::OK();
 }
@@ -211,7 +268,6 @@ Status DataFile::Append(const LogRecord& record, uint64_t* offset, uint32_t* wri
 
     std::string encoded = EncodeRecord(record);
 
-    // 追加写：始终 seek 到文件末尾
     file_.clear();
     file_.seekp(0, std::ios::end);
     if (!file_) {
@@ -239,7 +295,6 @@ Status DataFile::Append(const LogRecord& record, uint64_t* offset, uint32_t* wri
 }
 
 Status DataFile::Read(uint64_t offset, LogRecord* record, uint32_t* record_size) {
-    // 先读固定头
     char header[kHeaderSize];
     Status s = ReadBytes(offset, header, sizeof(header));
     if (!s.ok()) {
@@ -254,12 +309,14 @@ Status DataFile::Read(uint64_t offset, LogRecord* record, uint32_t* record_size)
     uint64_t timestamp = 0;
     uint32_t key_size = 0;
     uint32_t value_size = 0;
+    uint32_t crc = 0;
 
     if (!ReadFixed(header_buf, &pos, &magic) ||
         !ReadFixed(header_buf, &pos, &type) ||
         !ReadFixed(header_buf, &pos, &timestamp) ||
         !ReadFixed(header_buf, &pos, &key_size) ||
-        !ReadFixed(header_buf, &pos, &value_size)) {
+        !ReadFixed(header_buf, &pos, &value_size) ||
+        !ReadFixed(header_buf, &pos, &crc)) {
         return Status::Corruption("bad header");
     }
 
@@ -267,14 +324,11 @@ Status DataFile::Read(uint64_t offset, LogRecord* record, uint32_t* record_size)
         return Status::Corruption("bad magic");
     }
 
-    // 根据头部推算完整记录长度
     uint32_t total_size = static_cast<uint32_t>(kHeaderSize + key_size + value_size);
     std::string buf(total_size, '\0');
 
-    // 拷贝头部
     std::memcpy(buf.data(), header, kHeaderSize);
 
-    // 再读 key/value body
     if (key_size + value_size > 0) {
         s = ReadBytes(offset + kHeaderSize, buf.data() + kHeaderSize, key_size + value_size);
         if (!s.ok()) {
@@ -282,7 +336,6 @@ Status DataFile::Read(uint64_t offset, LogRecord* record, uint32_t* record_size)
         }
     }
 
-    // 最终统一走 DecodeRecord，保证解析逻辑一致
     s = DecodeRecord(buf, record);
     if (!s.ok()) {
         return s;

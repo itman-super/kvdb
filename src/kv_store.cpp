@@ -198,10 +198,14 @@ Status KVStore::Recover() {
 
         Status s = active_file_->Read(offset, &record, &record_size);
         if (!s.ok()) {
-            // 第一版策略较保守：
-            // 读失败就停止，认为可能是尾部不完整记录或文件已到末尾
-            // 后续更完善的版本应结合 CRC 和坏尾截断处理
-            break;
+            // IOError：通常表示到达文件末尾，或者尾部不完整记录
+            // 当前版本选择停止恢复
+            if (s.code() == Status::kIOError) {
+                break;
+            }
+
+            // Corruption：说明不是“正常结束”，而是记录真的坏了（例如 CRC 不匹配）
+            return s;
         }
 
         if (record.type == RecordType::kPut) {
