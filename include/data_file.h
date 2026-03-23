@@ -38,7 +38,7 @@ public:
 
     // 获取文件大小
     uint64_t Size();
-
+    Status Truncate(uint64_t size);   // 新增：坏尾恢复时裁剪文件
     uint32_t FileId() const { return file_id_; }
     const std::string& Path() const { return file_path_; }
 

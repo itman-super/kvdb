@@ -187,8 +187,6 @@ Status KVStore::Recover() {
         return Status::IOError("active file is null");
     }
 
-    // 恢复过程的本质：
-    // 顺序扫描 append-only log，把每个 key 的“最后一个版本”恢复到 index_ 中
     uint64_t file_size = active_file_->Size();
     uint64_t offset = 0;
 
@@ -198,18 +196,22 @@ Status KVStore::Recover() {
 
         Status s = active_file_->Read(offset, &record, &record_size);
         if (!s.ok()) {
-            // IOError：通常表示到达文件末尾，或者尾部不完整记录
-            // 当前版本选择停止恢复
+            // 坏尾恢复策略：
+            // IOError 通常表示尾部记录不完整（header/body 未读满）
+            // 直接把文件裁剪到最后一个完整 record 之后的位置
             if (s.code() == Status::kIOError) {
-                break;
+                Status ts = active_file_->Truncate(offset);
+                if (!ts.ok()) {
+                    return ts;
+                }
+                return Status::OK();
             }
 
-            // Corruption：说明不是“正常结束”，而是记录真的坏了（例如 CRC 不匹配）
+            // Corruption 先视为真正损坏，不自动修
             return s;
         }
 
         if (record.type == RecordType::kPut) {
-            // Put：覆盖 index_ 中该 key 的位置，保证总是指向最新版本
             IndexEntry entry;
             entry.file_id = active_file_id_;
             entry.offset = offset;
@@ -219,7 +221,6 @@ Status KVStore::Recover() {
             entry.tombstone = false;
             index_[record.key] = entry;
         } else if (record.type == RecordType::kDelete) {
-            // Delete：从索引中移除
             index_.erase(record.key);
         } else {
             return Status::Corruption("unknown record type");

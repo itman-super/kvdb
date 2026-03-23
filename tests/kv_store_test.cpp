@@ -1,20 +1,17 @@
+#include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
 
-#include "C:/Users/HONOR/Desktop/DB/include/kv_store.h"
+#include "kv_store.h"
 
 namespace fs = std::filesystem;
 
-// 这里实现一个最小测试框架，避免第一版就引入 gtest 依赖。
-// 核心思想：
-// - 每个测试函数独立准备目录
-// - 用断言宏校验行为
-// - 最后统一汇总测试结果
 static int g_passed = 0;
 static int g_failed = 0;
 
-// 断言表达式为真
 #define ASSERT_TRUE(expr)                                                     \
     do {                                                                      \
         if (!(expr)) {                                                        \
@@ -26,7 +23,6 @@ static int g_failed = 0;
         }                                                                     \
     } while (0)
 
-// 断言两个值相等
 #define ASSERT_EQ(lhs, rhs)                                                   \
     do {                                                                      \
         auto _lhs = (lhs);                                                    \
@@ -41,7 +37,6 @@ static int g_failed = 0;
         }                                                                     \
     } while (0)
 
-// 断言返回状态为 OK
 #define ASSERT_STATUS_OK(status_expr)                                         \
     do {                                                                      \
         Status _s = (status_expr);                                            \
@@ -55,7 +50,6 @@ static int g_failed = 0;
         }                                                                     \
     } while (0)
 
-// 断言返回状态码符合预期
 #define ASSERT_STATUS_CODE(status_expr, expected_code)                        \
     do {                                                                      \
         Status _s = (status_expr);                                            \
@@ -70,20 +64,17 @@ static int g_failed = 0;
         }                                                                     \
     } while (0)
 
-// 记录测试通过
 static void PassTest(const std::string& name) {
     std::cout << "[PASSED] " << name << std::endl;
     ++g_passed;
 }
 
-// 清理测试目录，保证测试相互隔离
 static void CleanDir(const std::string& path) {
     std::error_code ec;
     fs::remove_all(path, ec);
     fs::create_directories(path, ec);
 }
 
-// 统一构造测试配置
 static Options MakeOptions(const std::string& path) {
     Options opt;
     opt.db_path = path;
@@ -91,9 +82,54 @@ static Options MakeOptions(const std::string& path) {
     return opt;
 }
 
-// 测试最基本的写入和读取
+static std::string DataFilePath(const std::string& db_path) {
+    return db_path + "/data_1.log";
+}
+
+// 把文件某个位置的一个字节翻转，用于模拟磁盘数据损坏。
+// 这比直接覆盖成固定值更稳，因为基本能保证 CRC 改变。
+static bool FlipOneByte(const std::string& file_path, std::streamoff offset) {
+    std::fstream file(file_path, std::ios::in | std::ios::out | std::ios::binary);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    file.seekg(0, std::ios::end);
+    std::streamoff file_size = file.tellg();
+    if (offset < 0 || offset >= file_size) {
+        return false;
+    }
+
+    file.seekg(offset, std::ios::beg);
+    char ch = 0;
+    file.read(&ch, 1);
+    if (!file) {
+        return false;
+    }
+
+    ch ^= 0x01;
+
+    file.clear();
+    file.seekp(offset, std::ios::beg);
+    file.write(&ch, 1);
+    return static_cast<bool>(file);
+}
+
+// 截断文件末尾若干字节，用于模拟“尾部半条记录”。
+// Windows 下 std::filesystem::resize_file 可直接用。
+static bool TruncateFileTail(const std::string& file_path, std::uintmax_t bytes_to_remove) {
+    std::error_code ec;
+    std::uintmax_t size = fs::file_size(file_path, ec);
+    if (ec || size <= bytes_to_remove) {
+        return false;
+    }
+
+    fs::resize_file(file_path, size - bytes_to_remove, ec);
+    return !ec;
+}
+
 void TestPutAndGet() {
-    const std::string path = "./testdata/test_put_get";
+    const std::string path = "./testdata/test_put_get_crc";
     CleanDir(path);
 
     KVStore db(MakeOptions(path));
@@ -113,9 +149,8 @@ void TestPutAndGet() {
     PassTest(__FUNCTION__);
 }
 
-// 测试同一个 key 多次写入后，是否以最后一次为准
 void TestOverwrite() {
-    const std::string path = "./testdata/test_overwrite";
+    const std::string path = "./testdata/test_overwrite_crc";
     CleanDir(path);
 
     KVStore db(MakeOptions(path));
@@ -133,9 +168,8 @@ void TestOverwrite() {
     PassTest(__FUNCTION__);
 }
 
-// 测试删除后不可再读
 void TestDelete() {
-    const std::string path = "./testdata/test_delete";
+    const std::string path = "./testdata/test_delete_crc";
     CleanDir(path);
 
     KVStore db(MakeOptions(path));
@@ -151,9 +185,8 @@ void TestDelete() {
     PassTest(__FUNCTION__);
 }
 
-// 测试删除不存在的 key
 void TestDeleteNonExistentKey() {
-    const std::string path = "./testdata/test_delete_non_existent";
+    const std::string path = "./testdata/test_delete_non_existent_crc";
     CleanDir(path);
 
     KVStore db(MakeOptions(path));
@@ -165,9 +198,8 @@ void TestDeleteNonExistentKey() {
     PassTest(__FUNCTION__);
 }
 
-// 测试关闭再打开后，数据是否能恢复
 void TestRecoveryAfterReopen() {
-    const std::string path = "./testdata/test_recovery_reopen";
+    const std::string path = "./testdata/test_recovery_reopen_crc";
     CleanDir(path);
 
     {
@@ -196,9 +228,8 @@ void TestRecoveryAfterReopen() {
     PassTest(__FUNCTION__);
 }
 
-// 测试“覆盖写”在重启恢复后是否依旧正确
 void TestRecoveryWithOverwrite() {
-    const std::string path = "./testdata/test_recovery_overwrite";
+    const std::string path = "./testdata/test_recovery_overwrite_crc";
     CleanDir(path);
 
     {
@@ -225,9 +256,8 @@ void TestRecoveryWithOverwrite() {
     PassTest(__FUNCTION__);
 }
 
-// 测试删除在重启恢复后是否依旧生效
 void TestRecoveryWithDelete() {
-    const std::string path = "./testdata/test_recovery_delete";
+    const std::string path = "./testdata/test_recovery_delete_crc";
     CleanDir(path);
 
     {
@@ -256,9 +286,8 @@ void TestRecoveryWithDelete() {
     PassTest(__FUNCTION__);
 }
 
-// 测试空 key 的非法输入
 void TestEmptyKey() {
-    const std::string path = "./testdata/test_empty_key";
+    const std::string path = "./testdata/test_empty_key_crc";
     CleanDir(path);
 
     KVStore db(MakeOptions(path));
@@ -270,9 +299,8 @@ void TestEmptyKey() {
     PassTest(__FUNCTION__);
 }
 
-// 测试读取不存在的 key
 void TestGetNonExistentKey() {
-    const std::string path = "./testdata/test_get_non_existent";
+    const std::string path = "./testdata/test_get_non_existent_crc";
     CleanDir(path);
 
     KVStore db(MakeOptions(path));
@@ -282,6 +310,102 @@ void TestGetNonExistentKey() {
     ASSERT_STATUS_CODE(db.Get("missing", &value), Status::kNotFound);
 
     ASSERT_STATUS_OK(db.Close());
+    PassTest(__FUNCTION__);
+}
+
+// 新增：验证 CRC 正常路径下，大 value 也可以正确恢复。
+void TestRecoveryWithLargeValue() {
+    const std::string path = "./testdata/test_large_value_crc";
+    CleanDir(path);
+
+    std::string large_value(4096, 'x');
+
+    {
+        KVStore db(MakeOptions(path));
+        ASSERT_STATUS_OK(db.Open());
+        ASSERT_STATUS_OK(db.Put("blob", large_value));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    {
+        KVStore db(MakeOptions(path));
+        ASSERT_STATUS_OK(db.Open());
+
+        std::string value;
+        ASSERT_STATUS_OK(db.Get("blob", &value));
+        ASSERT_EQ(value, large_value);
+
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    PassTest(__FUNCTION__);
+}
+
+// 新增：手工修改日志中某个字节，期望下次 Open() 时恢复失败，返回 Corruption。
+// 因为 Recover() 会扫描 data_1.log，并在 Read()->DecodeRecord() 中发现 crc mismatch。
+void TestCRCDetectsCorruptionOnOpen() {
+    const std::string path = "./testdata/test_crc_detect_open";
+    CleanDir(path);
+
+    {
+        KVStore db(MakeOptions(path));
+        ASSERT_STATUS_OK(db.Open());
+        ASSERT_STATUS_OK(db.Put("k1", "hello"));
+        ASSERT_STATUS_OK(db.Put("k2", "world"));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    const std::string file_path = DataFilePath(path);
+
+    // 尽量改动 body 区域的某个字节，避免刚好只碰到无关位置。
+    // 这里用一个比较保守的偏移：头部之后若干字节。
+    ASSERT_TRUE(FlipOneByte(file_path, 32));
+
+    {
+        KVStore db(MakeOptions(path));
+        Status s = db.Open();
+        ASSERT_TRUE(!s.ok());
+        ASSERT_EQ(s.code(), Status::kCorruption);
+    }
+
+    PassTest(__FUNCTION__);
+}
+
+// 新增：模拟尾部半条记录。
+// 当前 Recover() 里如果遇到 IOError，会 break 并停止恢复。
+// 所以预期是：Open() 仍然成功，且至少前面的完整记录仍可读。
+void TestRecoveryStopsAtPartialTailRecord() {
+    const std::string path = "./testdata/test_partial_tail_crc";
+    CleanDir(path);
+
+    {
+        KVStore db(MakeOptions(path));
+        ASSERT_STATUS_OK(db.Open());
+        ASSERT_STATUS_OK(db.Put("k1", "v1"));
+        ASSERT_STATUS_OK(db.Put("k2", "v2"));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    const std::string file_path = DataFilePath(path);
+
+    // 截掉末尾几个字节，模拟最后一条记录不完整。
+    ASSERT_TRUE(TruncateFileTail(file_path, 3));
+
+    {
+        KVStore db(MakeOptions(path));
+        ASSERT_STATUS_OK(db.Open());
+
+        std::string value;
+        ASSERT_STATUS_OK(db.Get("k1", &value));
+        ASSERT_EQ(value, std::string("v1"));
+
+        // k2 可能因为最后一条记录损坏而恢复不到。
+        Status s = db.Get("k2", &value);
+        ASSERT_TRUE(s.ok() || s.code() == Status::kNotFound);
+
+        ASSERT_STATUS_OK(db.Close());
+    }
+
     PassTest(__FUNCTION__);
 }
 
@@ -295,6 +419,10 @@ int main() {
     TestRecoveryWithDelete();
     TestEmptyKey();
     TestGetNonExistentKey();
+
+    TestRecoveryWithLargeValue();
+    TestCRCDetectsCorruptionOnOpen();
+    TestRecoveryStopsAtPartialTailRecord();
 
     std::cout << "\n========== TEST SUMMARY ==========" << std::endl;
     std::cout << "PASSED: " << g_passed << std::endl;

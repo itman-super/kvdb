@@ -347,3 +347,26 @@ Status DataFile::Read(uint64_t offset, LogRecord* record, uint32_t* record_size)
 
     return Status::OK();
 }
+Status DataFile::Truncate(uint64_t size) {
+    if (!file_.is_open()) {
+        return Status::IOError("file not open");
+    }
+
+    // 先关闭当前流，否则某些平台下 resize_file 可能失败
+    file_.flush();
+    file_.close();
+
+    std::error_code ec;
+    std::filesystem::resize_file(file_path_, static_cast<std::uintmax_t>(size), ec);
+    if (ec) {
+        return Status::IOError("truncate failed: " + ec.message());
+    }
+
+    // 重新打开，保持对象可继续使用
+    Status s = Open(writable_);
+    if (!s.ok()) {
+        return s;
+    }
+
+    return Status::OK();
+}
