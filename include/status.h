@@ -1,3 +1,4 @@
+// include/status.h
 #pragma once
 
 #include <string>
@@ -12,7 +13,9 @@ public:
         kOk = 0,            // 成功
         kNotFound,          // key 不存在
         kIOError,           // 文件读写错误
+        kOutOfRange,        // 读取越界（offset/length 非法）
         kCorruption,        // 数据损坏、日志格式异常
+        kChecksumFailed,    // 校验失败（CRC mismatch）
         kInvalidArgument    // 非法参数
     };
 
@@ -26,7 +29,9 @@ public:
     static Status OK() { return Status(); }
     static Status NotFound(std::string msg = "") { return Status(kNotFound, std::move(msg)); }
     static Status IOError(std::string msg = "") { return Status(kIOError, std::move(msg)); }
+    static Status OutOfRange(std::string msg = "") { return Status(kOutOfRange, std::move(msg)); }
     static Status Corruption(std::string msg = "") { return Status(kCorruption, std::move(msg)); }
+    static Status ChecksumFailed(std::string msg = "") { return Status(kChecksumFailed, std::move(msg)); }
     static Status InvalidArgument(std::string msg = "") { return Status(kInvalidArgument, std::move(msg)); }
 
     // 是否成功
@@ -44,7 +49,9 @@ public:
             case kOk: return "OK";
             case kNotFound: return "NotFound: " + msg_;
             case kIOError: return "IOError: " + msg_;
+            case kOutOfRange: return "OutOfRange: " + msg_;
             case kCorruption: return "Corruption: " + msg_;
+            case kChecksumFailed: return "ChecksumFailed: " + msg_;
             case kInvalidArgument: return "InvalidArgument: " + msg_;
             default: return "Unknown";
         }

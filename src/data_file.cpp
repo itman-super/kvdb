@@ -1,7 +1,9 @@
+// src/data_file.cpp
 #include "data_file.h"
 
 #include <cstring>
 #include <filesystem>
+#include <limits>  // numeric_limits
 #include <vector>
 
 namespace {
@@ -103,7 +105,11 @@ Status DataFile::Open(bool writable) {
     file_.open(file_path_, mode);
 
     if (!file_.is_open() && writable_) {
+        // 可写模式下若文件不存在，先尝试创建空文件再以读写模式重新打开。
         std::ofstream create(file_path_, std::ios::binary | std::ios::out);
+        if (!create.is_open()) {
+            return Status::IOError("failed to create file: " + file_path_);
+        }
         create.close();
         file_.open(file_path_, mode);
     }
@@ -142,7 +148,16 @@ uint64_t DataFile::Size() {
 
     file_.clear();
     file_.seekg(0, std::ios::end);
-    return static_cast<uint64_t>(file_.tellg());
+    if (!file_) {
+        // seek 失败时返回 0，调用方会把它当作“无法获取尺寸”处理。
+        return 0;
+    }
+
+    std::streamoff pos = file_.tellg();
+    if (pos < 0) {
+        return 0;
+    }
+    return static_cast<uint64_t>(pos);
 }
 
 Status DataFile::WriteBytes(const char* data, std::size_t len) {
@@ -162,15 +177,29 @@ Status DataFile::ReadBytes(uint64_t offset, char* data, std::size_t len) {
         return Status::IOError("file not open");
     }
 
+    // 在真正读取前做边界校验，避免 seek/read 后才发现 EOF。
+    const uint64_t file_size = Size();
+    if (offset > file_size) {
+        return Status::OutOfRange("offset out of range: " + std::to_string(offset) +
+                                  ", file_size: " + std::to_string(file_size));
+    }
+    if (len > file_size - offset) {
+        return Status::OutOfRange("read out of range, offset: " + std::to_string(offset) +
+                                  ", len: " + std::to_string(len) +
+                                  ", file_size: " + std::to_string(file_size));
+    }
+
     file_.clear();
+    // seekg 失败通常意味着偏移非法或底层流状态异常。
     file_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     if (!file_) {
-        return Status::IOError("seekg failed");
+        return Status::IOError("seekg failed at offset: " + std::to_string(offset));
     }
 
     file_.read(data, static_cast<std::streamsize>(len));
     if (file_.gcount() != static_cast<std::streamsize>(len)) {
-        return Status::IOError("read failed or reached EOF");
+        return Status::IOError("read failed, expected: " + std::to_string(len) +
+                               ", got: " + std::to_string(file_.gcount()));
     }
 
     return Status::OK();
@@ -233,6 +262,12 @@ Status DataFile::DecodeRecord(const std::string& buf, LogRecord* record) {
         return Status::Corruption("bad magic");
     }
 
+    // 当前版本仅接受 Put/Delete 两种记录类型，其他值视为格式损坏。
+    if (type != static_cast<uint8_t>(RecordType::kPut) &&
+        type != static_cast<uint8_t>(RecordType::kDelete)) {
+        return Status::Corruption("bad record type");
+    }
+
     if (buf.size() != kHeaderSize + key_size + value_size) {
         return Status::Corruption("record size mismatch");
     }
@@ -250,7 +285,7 @@ Status DataFile::DecodeRecord(const std::string& buf, LogRecord* record) {
     );
 
     if (actual_crc != stored_crc) {
-        return Status::Corruption("crc mismatch");
+        return Status::ChecksumFailed("crc mismatch");
     }
 
     record->type = static_cast<RecordType>(type);
@@ -295,6 +330,10 @@ Status DataFile::Append(const LogRecord& record, uint64_t* offset, uint32_t* wri
 }
 
 Status DataFile::Read(uint64_t offset, LogRecord* record, uint32_t* record_size) {
+    if (record == nullptr) {
+        return Status::InvalidArgument("record output is null");
+    }
+
     char header[kHeaderSize];
     Status s = ReadBytes(offset, header, sizeof(header));
     if (!s.ok()) {
@@ -324,7 +363,15 @@ Status DataFile::Read(uint64_t offset, LogRecord* record, uint32_t* record_size)
         return Status::Corruption("bad magic");
     }
 
-    uint32_t total_size = static_cast<uint32_t>(kHeaderSize + key_size + value_size);
+    // 防御性校验：避免 key_size + value_size 溢出后导致分配/读取异常。
+    const uint64_t payload_size = static_cast<uint64_t>(key_size) + static_cast<uint64_t>(value_size);
+    const uint64_t total_size_64 = static_cast<uint64_t>(kHeaderSize) + payload_size;
+    if (payload_size > std::numeric_limits<uint32_t>::max() ||
+        total_size_64 > std::numeric_limits<uint32_t>::max()) {
+        return Status::Corruption("record length overflow");
+    }
+
+    uint32_t total_size = static_cast<uint32_t>(total_size_64);
     std::string buf(total_size, '\0');
 
     std::memcpy(buf.data(), header, kHeaderSize);

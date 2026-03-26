@@ -1,3 +1,4 @@
+// src/kv_store.cpp
 #include "kv_store.h"
 
 #include <ctime>
@@ -197,9 +198,9 @@ Status KVStore::Recover() {
         Status s = active_file_->Read(offset, &record, &record_size);
         if (!s.ok()) {
             // 坏尾恢复策略：
-            // IOError 通常表示尾部记录不完整（header/body 未读满）
+            // IOError / OutOfRange 通常表示尾部记录不完整（header/body 未读满）
             // 直接把文件裁剪到最后一个完整 record 之后的位置
-            if (s.code() == Status::kIOError) {
+            if (s.code() == Status::kIOError || s.code() == Status::kOutOfRange) {
                 Status ts = active_file_->Truncate(offset);
                 if (!ts.ok()) {
                     return ts;
@@ -207,7 +208,7 @@ Status KVStore::Recover() {
                 return Status::OK();
             }
 
-            // Corruption 先视为真正损坏，不自动修
+            // Corruption / ChecksumFailed 视为真正损坏，不自动修
             return s;
         }
 

@@ -1,3 +1,4 @@
+// tests/kv_store_test.cpp
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -5,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "data_file.h"
 #include "kv_store.h"
 
 namespace fs = std::filesystem;
@@ -341,8 +343,7 @@ void TestRecoveryWithLargeValue() {
     PassTest(__FUNCTION__);
 }
 
-// 新增：手工修改日志中某个字节，期望下次 Open() 时恢复失败，返回 Corruption。
-// 因为 Recover() 会扫描 data_1.log，并在 Read()->DecodeRecord() 中发现 crc mismatch。
+// 新增：手工破坏 magic 字段，期望下次 Open() 时恢复失败，返回 Corruption（格式损坏）。
 void TestCRCDetectsCorruptionOnOpen() {
     const std::string path = "./testdata/test_crc_detect_open";
     CleanDir(path);
@@ -357,9 +358,8 @@ void TestCRCDetectsCorruptionOnOpen() {
 
     const std::string file_path = DataFilePath(path);
 
-    // 尽量改动 body 区域的某个字节，避免刚好只碰到无关位置。
-    // 这里用一个比较保守的偏移：头部之后若干字节。
-    ASSERT_TRUE(FlipOneByte(file_path, 32));
+    // 改动文件开头的 magic 字段，触发 bad magic。
+    ASSERT_TRUE(FlipOneByte(file_path, 0));
 
     {
         KVStore db(MakeOptions(path));
@@ -409,6 +409,95 @@ void TestRecoveryStopsAtPartialTailRecord() {
     PassTest(__FUNCTION__);
 }
 
+void TestOpenFailureReturnsIOError() {
+    const std::string bad_path = "./testdata/not_exist_dir/data_1.log";
+    std::error_code ec;
+    fs::remove_all("./testdata/not_exist_dir", ec);
+
+    // 只读打开不存在文件：预期返回 IOError（不会自动创建）。
+    DataFile file(1, bad_path);
+    Status s = file.Open(false);
+    ASSERT_EQ(s.code(), Status::kIOError);
+    PassTest(__FUNCTION__);
+}
+
+void TestReadOutOfRangeReturnsOutOfRange() {
+    const std::string path = "./testdata/test_read_out_of_range";
+    CleanDir(path);
+    const std::string file_path = DataFilePath(path);
+
+    DataFile file(1, file_path);
+    ASSERT_STATUS_OK(file.Open(true));
+
+    LogRecord rec;
+    rec.type = RecordType::kPut;
+    rec.timestamp = 1;
+    rec.key = "k";
+    rec.value = "v";
+
+    uint64_t offset = 0;
+    uint32_t size = 0;
+    ASSERT_STATUS_OK(file.Append(rec, &offset, &size));
+
+    LogRecord out;
+    uint32_t out_size = 0;
+    // 构造越界 offset，验证返回 kOutOfRange。
+    Status s = file.Read(offset + size + 1, &out, &out_size);
+    ASSERT_EQ(s.code(), Status::kOutOfRange);
+    ASSERT_STATUS_OK(file.Close());
+    PassTest(__FUNCTION__);
+}
+
+void TestChecksumFailureReturnsChecksumFailed() {
+    const std::string path = "./testdata/test_checksum_failed_code";
+    CleanDir(path);
+
+    {
+        KVStore db(MakeOptions(path));
+        ASSERT_STATUS_OK(db.Open());
+        ASSERT_STATUS_OK(db.Put("k1", "hello"));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    const std::string file_path = DataFilePath(path);
+    // 修改 value 区域一个字节，触发 CRC mismatch。
+    ASSERT_TRUE(FlipOneByte(file_path, 26));
+
+    {
+        KVStore db(MakeOptions(path));
+        Status s = db.Open();
+        ASSERT_TRUE(!s.ok());
+        ASSERT_EQ(s.code(), Status::kChecksumFailed);
+    }
+
+    PassTest(__FUNCTION__);
+}
+
+void TestInvalidRecordTypeReturnsCorruption() {
+    const std::string path = "./testdata/test_invalid_record_type";
+    CleanDir(path);
+
+    {
+        KVStore db(MakeOptions(path));
+        ASSERT_STATUS_OK(db.Open());
+        ASSERT_STATUS_OK(db.Put("k1", "hello"));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    const std::string file_path = DataFilePath(path);
+    // type 字段位于 magic(4) 之后；翻转后应触发 bad record type。
+    ASSERT_TRUE(FlipOneByte(file_path, 4));
+
+    {
+        KVStore db(MakeOptions(path));
+        Status s = db.Open();
+        ASSERT_TRUE(!s.ok());
+        ASSERT_EQ(s.code(), Status::kCorruption);
+    }
+
+    PassTest(__FUNCTION__);
+}
+
 int main() {
     TestPutAndGet();
     TestOverwrite();
@@ -423,6 +512,10 @@ int main() {
     TestRecoveryWithLargeValue();
     TestCRCDetectsCorruptionOnOpen();
     TestRecoveryStopsAtPartialTailRecord();
+    TestOpenFailureReturnsIOError();
+    TestReadOutOfRangeReturnsOutOfRange();
+    TestChecksumFailureReturnsChecksumFailed();
+    TestInvalidRecordTypeReturnsCorruption();
 
     std::cout << "\n========== TEST SUMMARY ==========" << std::endl;
     std::cout << "PASSED: " << g_passed << std::endl;
