@@ -33,7 +33,7 @@ public:
     Status Read(uint64_t offset, LogRecord* record, uint32_t* record_size);
 
     // 刷盘
-    // 第一版仅 flush 到文件缓冲区，不保证真正 fsync 到磁盘设备
+    // 先 flush 用户态缓冲，再执行真正的 fsync/fdatasync（平台相关）。
     Status Sync();
 
     // 获取文件大小
@@ -60,4 +60,6 @@ private:
     std::string file_path_;
     std::fstream file_;
     bool writable_ = false;
+    bool need_dir_sync_ = false;
+    int sync_fd_ = -1;
 };
