@@ -6,6 +6,14 @@
 #include <limits>  // numeric_limits
 #include <vector>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace {
 
 // 新的 magic，可以和旧版本区分。
@@ -138,6 +146,42 @@ Status DataFile::Sync() {
     if (!file_) {
         return Status::IOError("flush failed");
     }
+
+#ifdef _WIN32
+    // fstream 不直接暴露 fd；这里重新打开句柄并调用 _commit 做真正落盘。
+    int fd = _open(file_path_.c_str(), _O_BINARY | _O_RDWR);
+    if (fd < 0) {
+        return Status::IOError("open for commit failed");
+    }
+
+    if (_commit(fd) != 0) {
+        _close(fd);
+        return Status::IOError("commit failed");
+    }
+
+    _close(fd);
+#else
+    // fstream 不直接暴露 fd；这里重新打开并执行 fdatasync/fsync。
+    int fd = ::open(file_path_.c_str(), O_RDWR);
+    if (fd < 0) {
+        return Status::IOError("open for sync failed");
+    }
+
+#if defined(__APPLE__)
+    if (::fsync(fd) != 0) {
+        ::close(fd);
+        return Status::IOError("fsync failed");
+    }
+#else
+    if (::fdatasync(fd) != 0) {
+        ::close(fd);
+        return Status::IOError("fdatasync failed");
+    }
+#endif
+
+    ::close(fd);
+#endif
+
     return Status::OK();
 }
 
