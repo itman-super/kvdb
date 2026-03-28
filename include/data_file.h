@@ -60,4 +60,6 @@ private:
     std::string file_path_;
     std::fstream file_;
     bool writable_ = false;
+    bool need_dir_sync_ = false;
+    int sync_fd_ = -1;
 };

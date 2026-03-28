@@ -89,6 +89,34 @@ uint32_t ComputeRecordCRC(uint8_t type,
     return crc;
 }
 
+#ifndef _WIN32
+Status SyncDirectoryIfNeeded(const std::string& file_path) {
+    std::error_code ec;
+    const std::filesystem::path dir_path = std::filesystem::path(file_path).parent_path();
+    if (dir_path.empty()) {
+        return Status::OK();
+    }
+
+    int flags = O_RDONLY;
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+
+    int dir_fd = ::open(dir_path.c_str(), flags);
+    if (dir_fd < 0) {
+        return Status::IOError("open dir for sync failed");
+    }
+
+    if (::fsync(dir_fd) != 0) {
+        ::close(dir_fd);
+        return Status::IOError("fsync dir failed");
+    }
+
+    ::close(dir_fd);
+    return Status::OK();
+}
+#endif
+
 }  // namespace
 
 DataFile::DataFile(uint32_t file_id, std::string file_path)
@@ -119,6 +147,7 @@ Status DataFile::Open(bool writable) {
             return Status::IOError("failed to create file: " + file_path_);
         }
         create.close();
+        need_dir_sync_ = true;
         file_.open(file_path_, mode);
     }
 
@@ -126,10 +155,34 @@ Status DataFile::Open(bool writable) {
         return Status::IOError("failed to open file: " + file_path_);
     }
 
+    if (writable_) {
+#ifdef _WIN32
+        sync_fd_ = _open(file_path_.c_str(), _O_BINARY | _O_RDWR);
+#else
+        sync_fd_ = ::open(file_path_.c_str(), O_RDWR);
+#endif
+        if (sync_fd_ < 0) {
+            file_.close();
+            return Status::IOError("failed to open sync fd: " + file_path_);
+        }
+    }
+
     return Status::OK();
 }
 
 Status DataFile::Close() {
+#ifdef _WIN32
+    if (sync_fd_ >= 0) {
+        _close(sync_fd_);
+        sync_fd_ = -1;
+    }
+#else
+    if (sync_fd_ >= 0) {
+        ::close(sync_fd_);
+        sync_fd_ = -1;
+    }
+#endif
+
     if (file_.is_open()) {
         file_.flush();
         file_.close();
@@ -148,38 +201,36 @@ Status DataFile::Sync() {
     }
 
 #ifdef _WIN32
-    // fstream 不直接暴露 fd；这里重新打开句柄并调用 _commit 做真正落盘。
-    int fd = _open(file_path_.c_str(), _O_BINARY | _O_RDWR);
-    if (fd < 0) {
-        return Status::IOError("open for commit failed");
+    if (sync_fd_ < 0) {
+        return Status::IOError("sync fd not open");
     }
 
-    if (_commit(fd) != 0) {
-        _close(fd);
+    if (_commit(sync_fd_) != 0) {
         return Status::IOError("commit failed");
     }
-
-    _close(fd);
+    need_dir_sync_ = false;
 #else
-    // fstream 不直接暴露 fd；这里重新打开并执行 fdatasync/fsync。
-    int fd = ::open(file_path_.c_str(), O_RDWR);
-    if (fd < 0) {
-        return Status::IOError("open for sync failed");
+    if (sync_fd_ < 0) {
+        return Status::IOError("sync fd not open");
     }
 
 #if defined(__APPLE__)
-    if (::fsync(fd) != 0) {
-        ::close(fd);
+    if (::fsync(sync_fd_) != 0) {
         return Status::IOError("fsync failed");
     }
 #else
-    if (::fdatasync(fd) != 0) {
-        ::close(fd);
+    if (::fdatasync(sync_fd_) != 0) {
         return Status::IOError("fdatasync failed");
     }
 #endif
 
-    ::close(fd);
+    if (need_dir_sync_) {
+        Status s = SyncDirectoryIfNeeded(file_path_);
+        if (!s.ok()) {
+            return s;
+        }
+        need_dir_sync_ = false;
+    }
 #endif
 
     return Status::OK();
