@@ -51,6 +51,74 @@ bool ParseDataFileId(const std::string& file_name, uint32_t* file_id) {
     }
 }
 
+bool IsRecoverableTailError(const Status& status) {
+    return status.code() == Status::kIOError || status.code() == Status::kOutOfRange;
+}
+
+enum class RecoverReadAction {
+    kContinueScanCurrentFile,
+    kStopScanCurrentFile,
+};
+
+// 处理恢复阶段的读失败：
+// - 若是可恢复的“尾部半条记录”错误，则截断到最后已知有效偏移并通知外层结束当前文件扫描；
+// - 若不是可恢复错误，直接把原错误返回给调用方。
+Status HandleRecoverReadFailure(DataFile* file,
+                                uint64_t safe_offset,
+                                const Status& read_status,
+                                RecoverReadAction* action) {
+    if (action == nullptr) {
+        return Status::InvalidArgument("action is null");
+    }
+
+    *action = RecoverReadAction::kContinueScanCurrentFile;
+    if (!IsRecoverableTailError(read_status)) {
+        return read_status;
+    }
+
+    // 尾部损坏场景：截断到最后完整记录的位置，避免后续再次读取到坏尾。
+    Status s = file->Truncate(safe_offset);
+    if (!s.ok()) {
+        return s;
+    }
+
+    *action = RecoverReadAction::kStopScanCurrentFile;
+    return Status::OK();
+}
+
+// 将一条已解码记录应用到内存索引：
+// - kDelete: 删除 key；
+// - kPut: 更新 key -> 最新位置；
+// - 其他类型：视为数据损坏。
+Status ApplyRecoveredRecord(uint32_t file_id,
+                            uint64_t offset,
+                            uint32_t record_size,
+                            const LogRecord& record,
+                            std::unordered_map<std::string, IndexEntry>* index) {
+    if (index == nullptr) {
+        return Status::InvalidArgument("index is null");
+    }
+
+    if (record.type == RecordType::kDelete) {
+        index->erase(record.key);
+        return Status::OK();
+    }
+
+    if (record.type != RecordType::kPut) {
+        return Status::Corruption("unknown record type");
+    }
+
+    IndexEntry entry;
+    entry.file_id = file_id;
+    entry.offset = offset;
+    entry.record_size = record_size;
+    entry.value_size = static_cast<uint32_t>(record.value.size());
+    entry.timestamp = record.timestamp;
+    entry.tombstone = false;
+    (*index)[record.key] = entry;
+    return Status::OK();
+}
+
 }  // namespace
 
 // 构造：保存配置。
@@ -335,6 +403,13 @@ Status KVStore::Delete(const std::string& key) {
 
 // 扫描所有 segment 做恢复。
 Status KVStore::Recover() {
+    // 恢复策略（分层处理）：
+    // 1) 按 file_id 升序扫描，保证“后写入覆盖先写入”的时序正确；
+    // 2) 每个文件从 offset=0 顺序读取记录；
+    // 3) 读失败时统一交给 HandleRecoverReadFailure：
+    //    - 可恢复尾部错误：截断后结束当前文件扫描，继续后续文件；
+    //    - 其他错误：立即失败并返回；
+    // 4) 读成功后统一交给 ApplyRecoveredRecord 更新内存索引。
     for (uint32_t file_id : ordered_file_ids_) {
         auto it = data_files_.find(file_id);
         if (it == data_files_.end()) {
@@ -351,32 +426,25 @@ Status KVStore::Recover() {
 
             Status s = file->Read(offset, &record, &record_size);
             if (!s.ok()) {
-                if ((s.code() == Status::kIOError || s.code() == Status::kOutOfRange) &&
-                    file_id == active_file_id_) {
-                    Status ts = file->Truncate(offset);
-                    if (!ts.ok()) {
-                        return ts;
-                    }
-                    break;
+                RecoverReadAction action = RecoverReadAction::kContinueScanCurrentFile;
+                s = HandleRecoverReadFailure(file, offset, s, &action);
+                if (!s.ok()) {
+                    return s;
                 }
+
+                switch (action) {
+                    case RecoverReadAction::kStopScanCurrentFile:
+                        break;
+                    case RecoverReadAction::kContinueScanCurrentFile:
+                        continue;
+                }
+                break;
+            }
+
+            s = ApplyRecoveredRecord(file_id, offset, record_size, record, &index_);
+            if (!s.ok()) {
                 return s;
             }
-
-            if (record.type == RecordType::kPut) {
-                IndexEntry entry;
-                entry.file_id = file_id;
-                entry.offset = offset;
-                entry.record_size = record_size;
-                entry.value_size = static_cast<uint32_t>(record.value.size());
-                entry.timestamp = record.timestamp;
-                entry.tombstone = false;
-                index_[record.key] = entry;
-            } else if (record.type == RecordType::kDelete) {
-                index_.erase(record.key);
-            } else {
-                return Status::Corruption("unknown record type");
-            }
-
             offset += record_size;
         }
     }

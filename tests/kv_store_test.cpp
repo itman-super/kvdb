@@ -445,6 +445,50 @@ void TestMultiSegmentRotationAndRecovery() {
     PassTest(__FUNCTION__);
 }
 
+void TestRecoverContinuesAfterPartialTailInOldSegment() {
+    const std::string path = "./testdata/test_recover_partial_old_segment";
+    CleanDir(path);
+
+    Options opt = MakeOptions(path);
+    opt.max_data_file_size = 70;
+
+    {
+        KVStore db(opt);
+        ASSERT_STATUS_OK(db.Open());
+        ASSERT_STATUS_OK(db.Put("k1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        ASSERT_STATUS_OK(db.Put("k2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        ASSERT_STATUS_OK(db.Put("k3", "cccccccccccccccccccccccccccccccc"));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    ASSERT_TRUE(fs::exists(DataFilePath(path, 1)));
+    ASSERT_TRUE(fs::exists(DataFilePath(path, 2)));
+    ASSERT_TRUE(fs::exists(DataFilePath(path, 3)));
+
+    // 人为制造“旧 segment 尾部半条记录”。
+    ASSERT_TRUE(TruncateFileTail(DataFilePath(path, 1), 5));
+
+    {
+        KVStore db(opt);
+        ASSERT_STATUS_OK(db.Open());
+
+        std::string value;
+        // 第一段最后一条可能被裁掉，因此 k1 可能丢失。
+        Status s1 = db.Get("k1", &value);
+        ASSERT_TRUE(s1.ok() || s1.code() == Status::kNotFound);
+
+        // 关键：后续 segment 仍应继续恢复。
+        ASSERT_STATUS_OK(db.Get("k2", &value));
+        ASSERT_EQ(value, std::string("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        ASSERT_STATUS_OK(db.Get("k3", &value));
+        ASSERT_EQ(value, std::string("cccccccccccccccccccccccccccccccc"));
+
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    PassTest(__FUNCTION__);
+}
+
 void TestOpenFailureReturnsIOError() {
     const std::string bad_path = "./testdata/not_exist_dir/data_1.log";
     std::error_code ec;
@@ -549,6 +593,7 @@ int main() {
     TestCRCDetectsCorruptionOnOpen();
     TestRecoveryStopsAtPartialTailRecord();
     TestMultiSegmentRotationAndRecovery();
+    TestRecoverContinuesAfterPartialTailInOldSegment();
     TestOpenFailureReturnsIOError();
     TestReadOutOfRangeReturnsOutOfRange();
     TestChecksumFailureReturnsChecksumFailed();
