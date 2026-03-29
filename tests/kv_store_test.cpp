@@ -84,8 +84,8 @@ static Options MakeOptions(const std::string& path) {
     return opt;
 }
 
-static std::string DataFilePath(const std::string& db_path) {
-    return db_path + "/data_1.log";
+static std::string DataFilePath(const std::string& db_path, uint32_t file_id = 1) {
+    return db_path + "/data_" + std::to_string(file_id) + ".log";
 }
 
 // 把文件某个位置的一个字节翻转，用于模拟磁盘数据损坏。
@@ -409,6 +409,42 @@ void TestRecoveryStopsAtPartialTailRecord() {
     PassTest(__FUNCTION__);
 }
 
+void TestMultiSegmentRotationAndRecovery() {
+    const std::string path = "./testdata/test_multi_segment_rotation";
+    CleanDir(path);
+
+    Options opt = MakeOptions(path);
+    opt.max_data_file_size = 64;
+
+    {
+        KVStore db(opt);
+        ASSERT_STATUS_OK(db.Open());
+        ASSERT_STATUS_OK(db.Put("k1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        ASSERT_STATUS_OK(db.Put("k2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        ASSERT_STATUS_OK(db.Put("k3", "cccccccccccccccccccccccccccccc"));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    ASSERT_TRUE(fs::exists(DataFilePath(path, 1)));
+    ASSERT_TRUE(fs::exists(DataFilePath(path, 2)));
+
+    {
+        KVStore db(opt);
+        ASSERT_STATUS_OK(db.Open());
+
+        std::string value;
+        ASSERT_STATUS_OK(db.Get("k1", &value));
+        ASSERT_EQ(value, std::string("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        ASSERT_STATUS_OK(db.Get("k2", &value));
+        ASSERT_EQ(value, std::string("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        ASSERT_STATUS_OK(db.Get("k3", &value));
+        ASSERT_EQ(value, std::string("cccccccccccccccccccccccccccccc"));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    PassTest(__FUNCTION__);
+}
+
 void TestOpenFailureReturnsIOError() {
     const std::string bad_path = "./testdata/not_exist_dir/data_1.log";
     std::error_code ec;
@@ -512,6 +548,7 @@ int main() {
     TestRecoveryWithLargeValue();
     TestCRCDetectsCorruptionOnOpen();
     TestRecoveryStopsAtPartialTailRecord();
+    TestMultiSegmentRotationAndRecovery();
     TestOpenFailureReturnsIOError();
     TestReadOutOfRangeReturnsOutOfRange();
     TestChecksumFailureReturnsChecksumFailed();
