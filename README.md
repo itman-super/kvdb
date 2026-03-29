@@ -7,7 +7,7 @@
 ## 特性概览
 
 - 基于追加写的持久化日志
-- 单 active data file：`data_1.log`
+- 多 segment data file：`data_<id>.log`
 - 内存索引：`key -> IndexEntry`
 - 支持 `Put` / `Get` / `Delete`
 - 删除使用 tombstone 语义
@@ -82,15 +82,20 @@ kvdb/
 
 因此删除状态在重启恢复后仍然成立。
 
-### 4. 启动恢复
+### 4. Segment 轮转与启动恢复
+
+写入时会根据 `max_data_file_size` 执行 rotation：
+
+1. 若 `active segment` 大小 + 新记录大小超过阈值，则切换到新的 `data_<id+1>.log`
+2. 老 segment 保持只读，供查询与恢复使用
 
 数据库 `Open()` 时会调用 `Recover()`：
 
-1. 顺序扫描日志文件
+1. 扫描目录下全部 `data_<id>.log`，按 `id` 升序恢复
 2. 逐条解析并校验记录
 3. 遇到 `kPut`：更新索引
 4. 遇到 `kDelete`：从索引中移除对应 key
-5. 如果尾部存在不完整记录：将日志截断到最后一条完整记录后继续使用
+5. 如果 active segment 尾部存在不完整记录：将其截断到最后一条完整记录后继续使用
 6. 如果遇到真正的数据损坏或 CRC 失败：返回错误，不自动修复
 
 ## 日志记录格式
@@ -127,7 +132,7 @@ key bytes + value bytes
 
 ### `DataFile`
 
-负责单个日志文件的底层读写：
+负责单个日志文件（segment）的底层读写：
 
 - 打开与关闭文件
 - 追加记录
@@ -146,7 +151,7 @@ key bytes + value bytes
 
 表示内存索引项，保存：
 
-- `file_id`
+- `file_id`（定位到具体 segment）
 - `offset`
 - `record_size`
 - `value_size`
@@ -166,7 +171,7 @@ key bytes + value bytes
 - `sync_on_write`
   每次写入后是否立即 `flush`
 - `max_data_file_size`
-  单个数据文件最大大小，当前仅保留配置位，尚未实现 rotation
+  单个 segment 的最大大小，超过后会自动 rotation
 
 说明：`sync_on_write` 当前调用的是 `file_.flush()`，并不是严格意义上的 `fsync` / `fdatasync`。
 
@@ -228,10 +233,12 @@ build/bin/
 ./build/bin/kvdb
 ```
 
-首次运行后，会在数据库目录下生成：
+首次运行后，会在数据库目录下生成类似文件：
 
 ```text
 ./data/data_1.log
+./data/data_2.log
+...
 ```
 
 ## 作为库使用
@@ -290,6 +297,7 @@ int main() {
 - 非法记录类型检测
 - 越界读取返回 `OutOfRange`
 - 尾部半条记录恢复与截断
+- 多 segment rotation 与重启恢复
 
 运行测试：
 
@@ -309,9 +317,7 @@ int main() {
 
 这是一个第一版原型，当前仍有明显限制：
 
-- 仅支持单个日志文件，固定写入 `data_1.log`
-- 尚未实现 segment rotation
-- 尚未实现 merge / compaction
+- 暂未实现 merge / compaction，历史 segment 只增不减
 - 覆盖写和删除会持续累积历史记录，日志只会增长
 - 内存索引全部常驻内存，没有容量控制
 - 没有并发控制，不具备线程安全保证
@@ -322,7 +328,6 @@ int main() {
 
 如果继续完善，比较自然的方向有：
 
-- 多 data file / segment rotation
 - merge / compaction
 - hint file，加快恢复速度
 - 更强的持久化控制
@@ -344,3 +349,9 @@ int main() {
 - 基础完整性校验
 
 如果你的目标是理解键值存储的基础结构，这个项目已经是一个清晰、可继续扩展的起点。
+
+## 学习笔记
+
+如果你想系统了解“从单日志到多 segment”的设计权衡、恢复策略与测试方法，可以阅读：
+
+- `docs/multi_segment_learning_notes.md`
