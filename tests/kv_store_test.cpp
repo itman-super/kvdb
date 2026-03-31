@@ -88,6 +88,24 @@ static std::string DataFilePath(const std::string& db_path, uint32_t file_id = 1
     return db_path + "/data_" + std::to_string(file_id) + ".log";
 }
 
+static int CountDataFiles(const std::string& db_path) {
+    std::error_code ec;
+    int count = 0;
+    for (const auto& entry : fs::directory_iterator(db_path, ec)) {
+        if (ec) {
+            return -1;
+        }
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("data_", 0) == 0 && entry.path().extension() == ".log") {
+            ++count;
+        }
+    }
+    return count;
+}
+
 // 把文件某个位置的一个字节翻转，用于模拟磁盘数据损坏。
 // 这比直接覆盖成固定值更稳，因为基本能保证 CRC 改变。
 static bool FlipOneByte(const std::string& file_path, std::streamoff offset) {
@@ -578,6 +596,134 @@ void TestInvalidRecordTypeReturnsCorruption() {
     PassTest(__FUNCTION__);
 }
 
+void TestMergeCompactionKeepsOnlyLiveKeys() {
+    const std::string path = "./testdata/test_merge_compaction_live_keys";
+    CleanDir(path);
+
+    Options opt = MakeOptions(path);
+    opt.max_data_file_size = 80;
+
+    {
+        KVStore db(opt);
+        ASSERT_STATUS_OK(db.Open());
+        ASSERT_STATUS_OK(db.Put("k1", "v1"));
+        ASSERT_STATUS_OK(db.Put("k1", "v2"));
+        ASSERT_STATUS_OK(db.Put("k2", "v3"));
+        ASSERT_STATUS_OK(db.Delete("k2"));
+        ASSERT_STATUS_OK(db.Put("k3", "v4"));
+        ASSERT_STATUS_OK(db.Put("k4", "v5"));
+
+        ASSERT_TRUE(CountDataFiles(path) >= 2);
+
+        ASSERT_STATUS_OK(db.Merge());
+        ASSERT_EQ(CountDataFiles(path), 1);
+
+        std::string value;
+        ASSERT_STATUS_OK(db.Get("k1", &value));
+        ASSERT_EQ(value, std::string("v2"));
+        ASSERT_STATUS_CODE(db.Get("k2", &value), Status::kNotFound);
+        ASSERT_STATUS_OK(db.Get("k3", &value));
+        ASSERT_EQ(value, std::string("v4"));
+        ASSERT_STATUS_OK(db.Get("k4", &value));
+        ASSERT_EQ(value, std::string("v5"));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    {
+        KVStore db(opt);
+        ASSERT_STATUS_OK(db.Open());
+        ASSERT_EQ(CountDataFiles(path), 1);
+
+        std::string value;
+        ASSERT_STATUS_OK(db.Get("k1", &value));
+        ASSERT_EQ(value, std::string("v2"));
+        ASSERT_STATUS_CODE(db.Get("k2", &value), Status::kNotFound);
+        ASSERT_STATUS_OK(db.Get("k3", &value));
+        ASSERT_EQ(value, std::string("v4"));
+        ASSERT_STATUS_OK(db.Get("k4", &value));
+        ASSERT_EQ(value, std::string("v5"));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    PassTest(__FUNCTION__);
+}
+
+void TestMergeOnEmptyDatabase() {
+    const std::string path = "./testdata/test_merge_empty_db";
+    CleanDir(path);
+
+    Options opt = MakeOptions(path);
+    KVStore db(opt);
+    ASSERT_STATUS_OK(db.Open());
+    ASSERT_STATUS_OK(db.Merge());
+    ASSERT_EQ(CountDataFiles(path), 1);
+    ASSERT_STATUS_OK(db.Close());
+
+    PassTest(__FUNCTION__);
+}
+
+void TestHintFileGeneratedAfterMerge() {
+    const std::string path = "./testdata/test_hint_after_merge";
+    CleanDir(path);
+
+    Options opt = MakeOptions(path);
+    opt.max_data_file_size = 80;
+
+    KVStore db(opt);
+    ASSERT_STATUS_OK(db.Open());
+    ASSERT_STATUS_OK(db.Put("k1", "v1"));
+    ASSERT_STATUS_OK(db.Put("k1", "v2"));
+    ASSERT_STATUS_OK(db.Put("k2", "v3"));
+    ASSERT_STATUS_OK(db.Merge());
+    ASSERT_STATUS_OK(db.Close());
+
+    ASSERT_TRUE(fs::exists(path + "/hint_index.bin"));
+    PassTest(__FUNCTION__);
+}
+
+void TestStaleHintFallsBackToLogRecovery() {
+    const std::string path = "./testdata/test_stale_hint_fallback";
+    CleanDir(path);
+
+    const std::string hint_path = path + "/hint_index.bin";
+    const std::string stale_hint_path = path + "/hint_stale.bin";
+
+    {
+        KVStore db(MakeOptions(path));
+        ASSERT_STATUS_OK(db.Open());
+        ASSERT_STATUS_OK(db.Put("k1", "v1"));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    std::error_code ec;
+    fs::copy_file(hint_path, stale_hint_path, fs::copy_options::overwrite_existing, ec);
+    ASSERT_TRUE(!ec);
+
+    {
+        KVStore db(MakeOptions(path));
+        ASSERT_STATUS_OK(db.Open());
+        ASSERT_STATUS_OK(db.Put("k2", "v2"));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    fs::copy_file(stale_hint_path, hint_path, fs::copy_options::overwrite_existing, ec);
+    ASSERT_TRUE(!ec);
+
+    {
+        KVStore db(MakeOptions(path));
+        ASSERT_STATUS_OK(db.Open());
+
+        std::string value;
+        ASSERT_STATUS_OK(db.Get("k1", &value));
+        ASSERT_EQ(value, std::string("v1"));
+        ASSERT_STATUS_OK(db.Get("k2", &value));
+        ASSERT_EQ(value, std::string("v2"));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    PassTest(__FUNCTION__);
+}
+
 int main() {
     TestPutAndGet();
     TestOverwrite();
@@ -598,6 +744,10 @@ int main() {
     TestReadOutOfRangeReturnsOutOfRange();
     TestChecksumFailureReturnsChecksumFailed();
     TestInvalidRecordTypeReturnsCorruption();
+    TestMergeCompactionKeepsOnlyLiveKeys();
+    TestMergeOnEmptyDatabase();
+    TestHintFileGeneratedAfterMerge();
+    TestStaleHintFallsBackToLogRecovery();
 
     std::cout << "\n========== TEST SUMMARY ==========" << std::endl;
     std::cout << "PASSED: " << g_passed << std::endl;

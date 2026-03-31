@@ -2,8 +2,10 @@
 #include "kv_store.h"
 
 #include <algorithm>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 
 namespace {
@@ -12,6 +14,24 @@ namespace {
 constexpr uint32_t kRecordHeaderSize =
     sizeof(uint32_t) + sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint32_t) +
     sizeof(uint32_t);
+
+constexpr uint32_t kHintMagic = 0x48494E54;  // "HINT"
+constexpr uint32_t kHintVersion = 2;
+
+template <typename T>
+void AppendFixed(std::string* out, const T& value) {
+    out->append(reinterpret_cast<const char*>(&value), sizeof(T));
+}
+
+template <typename T>
+bool ReadFixed(const std::string& buf, std::size_t* pos, T* value) {
+    if (pos == nullptr || value == nullptr || *pos + sizeof(T) > buf.size()) {
+        return false;
+    }
+    std::memcpy(value, buf.data() + *pos, sizeof(T));
+    *pos += sizeof(T);
+    return true;
+}
 
 // 判断文件名是否匹配 data_<id>.log，并解析出 file_id。
 bool ParseDataFileId(const std::string& file_name, uint32_t* file_id) {
@@ -134,6 +154,10 @@ std::string KVStore::BuildDataFilePath(uint32_t file_id) const {
     return options_.db_path + "/data_" + std::to_string(file_id) + ".log";
 }
 
+std::string KVStore::BuildHintFilePath() const {
+    return options_.db_path + "/hint_index.bin";
+}
+
 // 打开数据库并加载全部 segment。
 Status KVStore::Open() {
     if (opened_) {
@@ -195,7 +219,21 @@ Status KVStore::Open() {
         return Status::IOError("active file is null after open");
     }
 
-    Status s = Recover();
+    bool loaded_from_hint = false;
+    Status s = LoadHintFile(&loaded_from_hint);
+    if (!s.ok()) {
+        return s;
+    }
+
+    if (!loaded_from_hint) {
+        s = Recover();
+        if (!s.ok()) {
+            return s;
+        }
+    }
+
+    // 启动时如果 hint 缺失/过期，恢复后补写一份最新快照。
+    s = WriteHintFile();
     if (!s.ok()) {
         return s;
     }
@@ -208,6 +246,14 @@ Status KVStore::Open() {
 Status KVStore::Close() {
     if (!opened_ && data_files_.empty()) {
         return Status::OK();
+    }
+
+    // 关闭前尽量持久化索引快照，便于下次快速恢复。
+    if (opened_) {
+        Status s = WriteHintFile();
+        if (!s.ok()) {
+            return s;
+        }
     }
 
     for (auto& [file_id, file] : data_files_) {
@@ -398,6 +444,303 @@ Status KVStore::Delete(const std::string& key) {
     }
 
     index_.erase(key);
+    return Status::OK();
+}
+
+Status KVStore::Merge() {
+    if (!opened_) {
+        return Status::IOError("db not open");
+    }
+    if (active_file_ == nullptr) {
+        return Status::IOError("active file is null");
+    }
+
+    // 先构造 merged 文件及新索引；成功后再替换现有状态。
+    const uint32_t merged_file_id = active_file_id_ + 1;
+    auto merged_file = std::make_unique<DataFile>(merged_file_id, BuildDataFilePath(merged_file_id));
+    Status s = merged_file->Open(true);
+    if (!s.ok()) {
+        return s;
+    }
+
+    std::unordered_map<std::string, IndexEntry> compacted_index;
+    compacted_index.reserve(index_.size());
+
+    for (const auto& [key, entry] : index_) {
+        auto file_it = data_files_.find(entry.file_id);
+        if (file_it == data_files_.end()) {
+            return Status::Corruption("index points to missing data file during merge");
+        }
+
+        LogRecord record;
+        uint32_t record_size = 0;
+        s = file_it->second->Read(entry.offset, &record, &record_size);
+        if (!s.ok()) {
+            return s;
+        }
+
+        if (record.type != RecordType::kPut) {
+            return Status::Corruption("non-put record found in live index during merge");
+        }
+        if (record.key != key) {
+            return Status::Corruption("key mismatch between index and record during merge");
+        }
+
+        uint64_t new_offset = 0;
+        uint32_t new_size = 0;
+        s = merged_file->Append(record, &new_offset, &new_size);
+        if (!s.ok()) {
+            return s;
+        }
+
+        IndexEntry new_entry;
+        new_entry.file_id = merged_file_id;
+        new_entry.offset = new_offset;
+        new_entry.record_size = new_size;
+        new_entry.value_size = static_cast<uint32_t>(record.value.size());
+        new_entry.timestamp = record.timestamp;
+        new_entry.tombstone = false;
+        compacted_index[key] = new_entry;
+    }
+
+    s = merged_file->Sync();
+    if (!s.ok()) {
+        return s;
+    }
+
+    s = merged_file->Close();
+    if (!s.ok()) {
+        return s;
+    }
+
+    // 关闭并清理旧 segment 文件。
+    for (auto& [file_id, file] : data_files_) {
+        (void)file_id;
+        s = file->Close();
+        if (!s.ok()) {
+            return s;
+        }
+    }
+
+    for (uint32_t file_id : ordered_file_ids_) {
+        std::error_code ec;
+        std::filesystem::remove(BuildDataFilePath(file_id), ec);
+        if (ec) {
+            return Status::IOError("failed to remove old data file: " + ec.message());
+        }
+    }
+
+    data_files_.clear();
+    ordered_file_ids_.clear();
+    active_file_ = nullptr;
+
+    auto reopened_merged = std::make_unique<DataFile>(merged_file_id, BuildDataFilePath(merged_file_id));
+    s = reopened_merged->Open(true);
+    if (!s.ok()) {
+        return s;
+    }
+
+    active_file_ = reopened_merged.get();
+    data_files_[merged_file_id] = std::move(reopened_merged);
+    ordered_file_ids_.push_back(merged_file_id);
+    active_file_id_ = merged_file_id;
+    index_ = std::move(compacted_index);
+    return WriteHintFile();
+}
+
+Status KVStore::WriteHintFile() {
+    if (active_file_ == nullptr) {
+        return Status::IOError("active file is null");
+    }
+
+    std::string blob;
+    blob.reserve(64 + index_.size() * 48);
+
+    AppendFixed(&blob, kHintMagic);
+    AppendFixed(&blob, kHintVersion);
+    AppendFixed(&blob, active_file_id_);
+
+    const uint32_t file_count = static_cast<uint32_t>(ordered_file_ids_.size());
+    AppendFixed(&blob, file_count);
+    for (uint32_t file_id : ordered_file_ids_) {
+        auto it = data_files_.find(file_id);
+        if (it == data_files_.end()) {
+            return Status::Corruption("missing data file while writing hint");
+        }
+        AppendFixed(&blob, file_id);
+        AppendFixed(&blob, it->second->Size());
+    }
+
+    const uint64_t count = static_cast<uint64_t>(index_.size());
+    AppendFixed(&blob, count);
+
+    for (const auto& [key, entry] : index_) {
+        const uint32_t key_size = static_cast<uint32_t>(key.size());
+        AppendFixed(&blob, key_size);
+        blob.append(key);
+        AppendFixed(&blob, entry.file_id);
+        AppendFixed(&blob, entry.offset);
+        AppendFixed(&blob, entry.record_size);
+        AppendFixed(&blob, entry.value_size);
+        AppendFixed(&blob, entry.timestamp);
+    }
+
+    const std::string hint_path = BuildHintFilePath();
+    const std::string tmp_path = hint_path + ".tmp";
+
+    std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        return Status::IOError("failed to open hint temp file");
+    }
+    out.write(blob.data(), static_cast<std::streamsize>(blob.size()));
+    if (!out) {
+        return Status::IOError("failed to write hint temp file");
+    }
+    out.flush();
+    out.close();
+
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, hint_path, ec);
+    if (ec) {
+        std::filesystem::remove(hint_path, ec);
+        ec.clear();
+        std::filesystem::rename(tmp_path, hint_path, ec);
+        if (ec) {
+            return Status::IOError("failed to replace hint file: " + ec.message());
+        }
+    }
+
+    return Status::OK();
+}
+
+Status KVStore::LoadHintFile(bool* loaded) {
+    if (loaded == nullptr) {
+        return Status::InvalidArgument("loaded is null");
+    }
+    *loaded = false;
+
+    const std::string hint_path = BuildHintFilePath();
+    if (!std::filesystem::exists(hint_path)) {
+        return Status::OK();
+    }
+
+    std::ifstream in(hint_path, std::ios::binary);
+    if (!in.is_open()) {
+        return Status::IOError("failed to open hint file");
+    }
+
+    in.seekg(0, std::ios::end);
+    std::streamoff size = in.tellg();
+    if (size <= 0) {
+        return Status::OK();
+    }
+    in.seekg(0, std::ios::beg);
+
+    std::string blob(static_cast<std::size_t>(size), '\0');
+    in.read(blob.data(), size);
+    if (in.gcount() != size) {
+        return Status::IOError("failed to read hint file");
+    }
+
+    std::size_t pos = 0;
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint32_t snapshot_active_file_id = 0;
+    uint32_t snapshot_file_count = 0;
+
+    if (!ReadFixed(blob, &pos, &magic) ||
+        !ReadFixed(blob, &pos, &version) ||
+        !ReadFixed(blob, &pos, &snapshot_active_file_id) ||
+        !ReadFixed(blob, &pos, &snapshot_file_count)) {
+        return Status::OK();
+    }
+
+    if (magic != kHintMagic || version != kHintVersion) {
+        return Status::OK();
+    }
+
+    if (snapshot_active_file_id != active_file_id_) {
+        return Status::OK();
+    }
+
+    if (snapshot_file_count != ordered_file_ids_.size()) {
+        return Status::OK();
+    }
+
+    for (std::size_t i = 0; i < snapshot_file_count; ++i) {
+        uint32_t snapshot_file_id = 0;
+        uint64_t snapshot_file_size = 0;
+        if (!ReadFixed(blob, &pos, &snapshot_file_id) ||
+            !ReadFixed(blob, &pos, &snapshot_file_size)) {
+            return Status::OK();
+        }
+
+        auto it = data_files_.find(snapshot_file_id);
+        if (it == data_files_.end()) {
+            return Status::OK();
+        }
+
+        if (it->second->Size() != snapshot_file_size) {
+            return Status::OK();
+        }
+    }
+
+    uint64_t count = 0;
+    if (!ReadFixed(blob, &pos, &count)) {
+        return Status::OK();
+    }
+
+    std::unordered_map<std::string, IndexEntry> loaded_index;
+    loaded_index.reserve(static_cast<std::size_t>(count));
+
+    for (uint64_t i = 0; i < count; ++i) {
+        uint32_t key_size = 0;
+        if (!ReadFixed(blob, &pos, &key_size)) {
+            return Status::OK();
+        }
+        if (pos + key_size > blob.size()) {
+            return Status::OK();
+        }
+        std::string key(blob.data() + pos, key_size);
+        pos += key_size;
+
+        IndexEntry entry;
+        if (!ReadFixed(blob, &pos, &entry.file_id) ||
+            !ReadFixed(blob, &pos, &entry.offset) ||
+            !ReadFixed(blob, &pos, &entry.record_size) ||
+            !ReadFixed(blob, &pos, &entry.value_size) ||
+            !ReadFixed(blob, &pos, &entry.timestamp)) {
+            return Status::OK();
+        }
+
+        entry.tombstone = false;
+        loaded_index[key] = entry;
+    }
+
+    if (pos != blob.size()) {
+        return Status::OK();
+    }
+
+    // 防止错误 hint 掩盖日志损坏：逐条抽样校验索引项能被真实读取且 key/type 匹配。
+    for (const auto& [key, entry] : loaded_index) {
+        auto it = data_files_.find(entry.file_id);
+        if (it == data_files_.end()) {
+            return Status::Corruption("hint points to missing data file");
+        }
+
+        LogRecord record;
+        uint32_t record_size = 0;
+        Status s = it->second->Read(entry.offset, &record, &record_size);
+        if (!s.ok()) {
+            return s;
+        }
+        if (record.type != RecordType::kPut || record.key != key) {
+            return Status::Corruption("hint validation failed");
+        }
+    }
+
+    index_ = std::move(loaded_index);
+    *loaded = true;
     return Status::OK();
 }
 

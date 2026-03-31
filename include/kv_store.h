@@ -40,6 +40,12 @@ public:
     // 删除 key（写入 tombstone）。
     Status Delete(const std::string& key);
 
+    // 手动触发 Merge/Compaction：
+    // - 仅保留当前“存活”的 key 最新值
+    // - 清理历史旧版本和 tombstone
+    // - 产出新的单一 active segment
+    Status Merge();
+
 private:
     // 启动恢复：按 file_id 升序扫描所有 segment，重建 index_。
     Status Recover();
@@ -58,6 +64,16 @@ private:
 
     // 生成指定 file_id 的 segment 文件路径。
     std::string BuildDataFilePath(uint32_t file_id) const;
+
+    // 生成 hint/snapshot 文件路径。
+    std::string BuildHintFilePath() const;
+
+    // 写入内存索引快照（hint file），用于加速重启恢复。
+    Status WriteHintFile();
+
+    // 读取并加载索引快照。
+    // loaded=true 表示快照校验通过且已加载，可跳过全量日志扫描。
+    Status LoadHintFile(bool* loaded);
 
 private:
     Options options_;
