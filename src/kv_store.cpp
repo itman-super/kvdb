@@ -401,6 +401,107 @@ Status KVStore::Delete(const std::string& key) {
     return Status::OK();
 }
 
+Status KVStore::Merge() {
+    if (!opened_) {
+        return Status::IOError("db not open");
+    }
+    if (active_file_ == nullptr) {
+        return Status::IOError("active file is null");
+    }
+
+    // 先构造 merged 文件及新索引；成功后再替换现有状态。
+    const uint32_t merged_file_id = active_file_id_ + 1;
+    auto merged_file = std::make_unique<DataFile>(merged_file_id, BuildDataFilePath(merged_file_id));
+    Status s = merged_file->Open(true);
+    if (!s.ok()) {
+        return s;
+    }
+
+    std::unordered_map<std::string, IndexEntry> compacted_index;
+    compacted_index.reserve(index_.size());
+
+    for (const auto& [key, entry] : index_) {
+        auto file_it = data_files_.find(entry.file_id);
+        if (file_it == data_files_.end()) {
+            return Status::Corruption("index points to missing data file during merge");
+        }
+
+        LogRecord record;
+        uint32_t record_size = 0;
+        s = file_it->second->Read(entry.offset, &record, &record_size);
+        if (!s.ok()) {
+            return s;
+        }
+
+        if (record.type != RecordType::kPut) {
+            return Status::Corruption("non-put record found in live index during merge");
+        }
+        if (record.key != key) {
+            return Status::Corruption("key mismatch between index and record during merge");
+        }
+
+        uint64_t new_offset = 0;
+        uint32_t new_size = 0;
+        s = merged_file->Append(record, &new_offset, &new_size);
+        if (!s.ok()) {
+            return s;
+        }
+
+        IndexEntry new_entry;
+        new_entry.file_id = merged_file_id;
+        new_entry.offset = new_offset;
+        new_entry.record_size = new_size;
+        new_entry.value_size = static_cast<uint32_t>(record.value.size());
+        new_entry.timestamp = record.timestamp;
+        new_entry.tombstone = false;
+        compacted_index[key] = new_entry;
+    }
+
+    s = merged_file->Sync();
+    if (!s.ok()) {
+        return s;
+    }
+
+    s = merged_file->Close();
+    if (!s.ok()) {
+        return s;
+    }
+
+    // 关闭并清理旧 segment 文件。
+    for (auto& [file_id, file] : data_files_) {
+        (void)file_id;
+        s = file->Close();
+        if (!s.ok()) {
+            return s;
+        }
+    }
+
+    for (uint32_t file_id : ordered_file_ids_) {
+        std::error_code ec;
+        std::filesystem::remove(BuildDataFilePath(file_id), ec);
+        if (ec) {
+            return Status::IOError("failed to remove old data file: " + ec.message());
+        }
+    }
+
+    data_files_.clear();
+    ordered_file_ids_.clear();
+    active_file_ = nullptr;
+
+    auto reopened_merged = std::make_unique<DataFile>(merged_file_id, BuildDataFilePath(merged_file_id));
+    s = reopened_merged->Open(true);
+    if (!s.ok()) {
+        return s;
+    }
+
+    active_file_ = reopened_merged.get();
+    data_files_[merged_file_id] = std::move(reopened_merged);
+    ordered_file_ids_.push_back(merged_file_id);
+    active_file_id_ = merged_file_id;
+    index_ = std::move(compacted_index);
+    return Status::OK();
+}
+
 // 扫描所有 segment 做恢复。
 Status KVStore::Recover() {
     // 恢复策略（分层处理）：

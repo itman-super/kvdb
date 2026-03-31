@@ -40,6 +40,12 @@ public:
     // 删除 key（写入 tombstone）。
     Status Delete(const std::string& key);
 
+    // 手动触发 Merge/Compaction：
+    // - 仅保留当前“存活”的 key 最新值
+    // - 清理历史旧版本和 tombstone
+    // - 产出新的单一 active segment
+    Status Merge();
+
 private:
     // 启动恢复：按 file_id 升序扫描所有 segment，重建 index_。
     Status Recover();
