@@ -1,0 +1,4 @@
+/home/runner/work/kvdb/kvdb/build/CMakeFiles/kvdb.dir
+/home/runner/work/kvdb/kvdb/build/CMakeFiles/kvdb_test.dir
+/home/runner/work/kvdb/kvdb/build/CMakeFiles/edit_cache.dir
+/home/runner/work/kvdb/kvdb/build/CMakeFiles/rebuild_cache.dir
