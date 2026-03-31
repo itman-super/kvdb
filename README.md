@@ -8,10 +8,13 @@
 
 - 基于追加写的持久化日志
 - 多 segment data file：`data_<id>.log`
+- Merge 后生成 hint file：`hint_<id>.hint`
 - 内存索引：`key -> IndexEntry`
+- 关闭时持久化索引快照：`index.snapshot`
 - 支持 `Put` / `Get` / `Delete`
 - 删除使用 tombstone 语义
 - 重启后可通过扫描日志恢复索引
+- 若 snapshot 校验通过，优先从 `index.snapshot` 快速恢复
 - 记录级校验
 - 校验项包含 `magic` 和 `CRC32`
 - 基础错误码封装：`OK`、`NotFound`、`IOError`、`OutOfRange`、`Corruption`、`ChecksumFailed`、`InvalidArgument`

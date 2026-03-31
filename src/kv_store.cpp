@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 
 namespace {
@@ -12,6 +13,10 @@ namespace {
 constexpr uint32_t kRecordHeaderSize =
     sizeof(uint32_t) + sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint32_t) +
     sizeof(uint32_t);
+
+constexpr uint32_t kHintMagic = 0x4B564848;      // KVHH
+constexpr uint32_t kSnapshotMagic = 0x4B565350;  // KVSP
+constexpr uint32_t kFormatVersion = 1;
 
 // 判断文件名是否匹配 data_<id>.log，并解析出 file_id。
 bool ParseDataFileId(const std::string& file_name, uint32_t* file_id) {
@@ -60,9 +65,6 @@ enum class RecoverReadAction {
     kStopScanCurrentFile,
 };
 
-// 处理恢复阶段的读失败：
-// - 若是可恢复的“尾部半条记录”错误，则截断到最后已知有效偏移并通知外层结束当前文件扫描；
-// - 若不是可恢复错误，直接把原错误返回给调用方。
 Status HandleRecoverReadFailure(DataFile* file,
                                 uint64_t safe_offset,
                                 const Status& read_status,
@@ -76,7 +78,6 @@ Status HandleRecoverReadFailure(DataFile* file,
         return read_status;
     }
 
-    // 尾部损坏场景：截断到最后完整记录的位置，避免后续再次读取到坏尾。
     Status s = file->Truncate(safe_offset);
     if (!s.ok()) {
         return s;
@@ -86,10 +87,6 @@ Status HandleRecoverReadFailure(DataFile* file,
     return Status::OK();
 }
 
-// 将一条已解码记录应用到内存索引：
-// - kDelete: 删除 key；
-// - kPut: 更新 key -> 最新位置；
-// - 其他类型：视为数据损坏。
 Status ApplyRecoveredRecord(uint32_t file_id,
                             uint64_t offset,
                             uint32_t record_size,
@@ -121,20 +118,24 @@ Status ApplyRecoveredRecord(uint32_t file_id,
 
 }  // namespace
 
-// 构造：保存配置。
 KVStore::KVStore(Options options) : options_(std::move(options)) {}
 
-// 析构：确保资源释放。
 KVStore::~KVStore() {
     Close();
 }
 
-// 生成 data_<id>.log 的完整路径。
 std::string KVStore::BuildDataFilePath(uint32_t file_id) const {
     return options_.db_path + "/data_" + std::to_string(file_id) + ".log";
 }
 
-// 打开数据库并加载全部 segment。
+std::string KVStore::BuildIndexSnapshotPath() const {
+    return options_.db_path + "/index.snapshot";
+}
+
+std::string KVStore::BuildHintFilePath(uint32_t file_id) const {
+    return options_.db_path + "/hint_" + std::to_string(file_id) + ".hint";
+}
+
 Status KVStore::Open() {
     if (opened_) {
         return Status::OK();
@@ -195,7 +196,8 @@ Status KVStore::Open() {
         return Status::IOError("active file is null after open");
     }
 
-    Status s = Recover();
+    const bool loaded_from_snapshot = TryLoadIndexSnapshot();
+    Status s = loaded_from_snapshot ? Status::OK() : Recover();
     if (!s.ok()) {
         return s;
     }
@@ -204,7 +206,6 @@ Status KVStore::Open() {
     return Status::OK();
 }
 
-// 关闭数据库。
 Status KVStore::Close() {
     if (!opened_ && data_files_.empty()) {
         return Status::OK();
@@ -222,15 +223,203 @@ Status KVStore::Close() {
     ordered_file_ids_.clear();
     active_file_ = nullptr;
     opened_ = false;
+    return SaveIndexSnapshot();
+}
+
+bool KVStore::TryLoadIndexSnapshot() {
+    std::ifstream in(BuildIndexSnapshotPath(), std::ios::binary);
+    if (!in.is_open()) {
+        return false;
+    }
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint32_t file_count = 0;
+    uint32_t entry_count = 0;
+    uint32_t snapshot_active_file_id = 0;
+
+    in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    in.read(reinterpret_cast<char*>(&version), sizeof(version));
+    in.read(reinterpret_cast<char*>(&file_count), sizeof(file_count));
+    in.read(reinterpret_cast<char*>(&entry_count), sizeof(entry_count));
+    in.read(reinterpret_cast<char*>(&snapshot_active_file_id), sizeof(snapshot_active_file_id));
+    if (!in || magic != kSnapshotMagic || version != kFormatVersion) {
+        return false;
+    }
+
+    std::vector<uint32_t> snapshot_file_ids;
+    snapshot_file_ids.reserve(file_count);
+    for (uint32_t i = 0; i < file_count; ++i) {
+        uint32_t fid = 0;
+        uint64_t file_size = 0;
+        int64_t file_mtime = 0;
+        in.read(reinterpret_cast<char*>(&fid), sizeof(fid));
+        in.read(reinterpret_cast<char*>(&file_size), sizeof(file_size));
+        in.read(reinterpret_cast<char*>(&file_mtime), sizeof(file_mtime));
+        if (!in) {
+            return false;
+        }
+        snapshot_file_ids.push_back(fid);
+
+        std::error_code ec;
+        const uint64_t current_size = std::filesystem::file_size(BuildDataFilePath(fid), ec);
+        if (ec || current_size != file_size) {
+            return false;
+        }
+        const auto current_mtime = std::filesystem::last_write_time(BuildDataFilePath(fid), ec);
+        if (ec) {
+            return false;
+        }
+        const int64_t current_mtime_ticks = static_cast<int64_t>(current_mtime.time_since_epoch().count());
+        if (current_mtime_ticks != file_mtime) {
+            return false;
+        }
+    }
+
+    std::sort(snapshot_file_ids.begin(), snapshot_file_ids.end());
+    std::vector<uint32_t> current_ids = ordered_file_ids_;
+    std::sort(current_ids.begin(), current_ids.end());
+    if (snapshot_file_ids != current_ids || snapshot_active_file_id != active_file_id_) {
+        return false;
+    }
+
+    std::unordered_map<std::string, IndexEntry> loaded_index;
+    loaded_index.reserve(entry_count);
+    for (uint32_t i = 0; i < entry_count; ++i) {
+        uint32_t key_size = 0;
+        in.read(reinterpret_cast<char*>(&key_size), sizeof(key_size));
+        if (!in) {
+            return false;
+        }
+
+        std::string key;
+        key.resize(key_size);
+        in.read(key.data(), static_cast<std::streamsize>(key_size));
+        if (!in) {
+            return false;
+        }
+
+        IndexEntry entry;
+        in.read(reinterpret_cast<char*>(&entry.file_id), sizeof(entry.file_id));
+        in.read(reinterpret_cast<char*>(&entry.offset), sizeof(entry.offset));
+        in.read(reinterpret_cast<char*>(&entry.record_size), sizeof(entry.record_size));
+        in.read(reinterpret_cast<char*>(&entry.value_size), sizeof(entry.value_size));
+        in.read(reinterpret_cast<char*>(&entry.timestamp), sizeof(entry.timestamp));
+        in.read(reinterpret_cast<char*>(&entry.tombstone), sizeof(entry.tombstone));
+        if (!in) {
+            return false;
+        }
+
+        loaded_index.emplace(std::move(key), entry);
+    }
+
+    index_ = std::move(loaded_index);
+    return true;
+}
+
+Status KVStore::SaveIndexSnapshot() const {
+    std::ofstream out(BuildIndexSnapshotPath(), std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        return Status::IOError("failed to open index snapshot");
+    }
+
+    const uint32_t file_count = static_cast<uint32_t>(ordered_file_ids_.size());
+    const uint32_t entry_count = static_cast<uint32_t>(index_.size());
+
+    out.write(reinterpret_cast<const char*>(&kSnapshotMagic), sizeof(kSnapshotMagic));
+    out.write(reinterpret_cast<const char*>(&kFormatVersion), sizeof(kFormatVersion));
+    out.write(reinterpret_cast<const char*>(&file_count), sizeof(file_count));
+    out.write(reinterpret_cast<const char*>(&entry_count), sizeof(entry_count));
+    out.write(reinterpret_cast<const char*>(&active_file_id_), sizeof(active_file_id_));
+
+    for (uint32_t file_id : ordered_file_ids_) {
+        std::error_code ec;
+        const uint64_t file_size = std::filesystem::file_size(BuildDataFilePath(file_id), ec);
+        if (ec) {
+            return Status::IOError("failed to stat data file for snapshot");
+        }
+        const auto mtime = std::filesystem::last_write_time(BuildDataFilePath(file_id), ec);
+        if (ec) {
+            return Status::IOError("failed to stat data file mtime for snapshot");
+        }
+        const int64_t mtime_ticks = static_cast<int64_t>(mtime.time_since_epoch().count());
+
+        out.write(reinterpret_cast<const char*>(&file_id), sizeof(file_id));
+        out.write(reinterpret_cast<const char*>(&file_size), sizeof(file_size));
+        out.write(reinterpret_cast<const char*>(&mtime_ticks), sizeof(mtime_ticks));
+    }
+
+    for (const auto& [key, entry] : index_) {
+        const uint32_t key_size = static_cast<uint32_t>(key.size());
+        out.write(reinterpret_cast<const char*>(&key_size), sizeof(key_size));
+        out.write(key.data(), static_cast<std::streamsize>(key.size()));
+        out.write(reinterpret_cast<const char*>(&entry.file_id), sizeof(entry.file_id));
+        out.write(reinterpret_cast<const char*>(&entry.offset), sizeof(entry.offset));
+        out.write(reinterpret_cast<const char*>(&entry.record_size), sizeof(entry.record_size));
+        out.write(reinterpret_cast<const char*>(&entry.value_size), sizeof(entry.value_size));
+        out.write(reinterpret_cast<const char*>(&entry.timestamp), sizeof(entry.timestamp));
+        out.write(reinterpret_cast<const char*>(&entry.tombstone), sizeof(entry.tombstone));
+    }
+
+    if (!out) {
+        return Status::IOError("failed to write index snapshot");
+    }
     return Status::OK();
 }
 
-// 估算记录编码大小，供 rotate 判定使用。
+Status KVStore::RecoverFromHintFile(uint32_t file_id) {
+    std::ifstream in(BuildHintFilePath(file_id), std::ios::binary);
+    if (!in.is_open()) {
+        return Status::NotFound("hint file not found");
+    }
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint32_t hint_file_id = 0;
+    uint32_t entry_count = 0;
+    in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    in.read(reinterpret_cast<char*>(&version), sizeof(version));
+    in.read(reinterpret_cast<char*>(&hint_file_id), sizeof(hint_file_id));
+    in.read(reinterpret_cast<char*>(&entry_count), sizeof(entry_count));
+    if (!in || magic != kHintMagic || version != kFormatVersion || hint_file_id != file_id) {
+        return Status::Corruption("invalid hint file");
+    }
+
+    for (uint32_t i = 0; i < entry_count; ++i) {
+        uint32_t key_size = 0;
+        in.read(reinterpret_cast<char*>(&key_size), sizeof(key_size));
+        if (!in) {
+            return Status::Corruption("invalid hint key size");
+        }
+
+        std::string key;
+        key.resize(key_size);
+        in.read(key.data(), static_cast<std::streamsize>(key_size));
+        if (!in) {
+            return Status::Corruption("invalid hint key bytes");
+        }
+
+        IndexEntry entry;
+        in.read(reinterpret_cast<char*>(&entry.offset), sizeof(entry.offset));
+        in.read(reinterpret_cast<char*>(&entry.record_size), sizeof(entry.record_size));
+        in.read(reinterpret_cast<char*>(&entry.value_size), sizeof(entry.value_size));
+        in.read(reinterpret_cast<char*>(&entry.timestamp), sizeof(entry.timestamp));
+        if (!in) {
+            return Status::Corruption("invalid hint entry");
+        }
+
+        entry.file_id = file_id;
+        entry.tombstone = false;
+        index_[std::move(key)] = entry;
+    }
+
+    return Status::OK();
+}
+
 uint32_t KVStore::EstimateRecordSize(const LogRecord& record) const {
     return static_cast<uint32_t>(kRecordHeaderSize + record.key.size() + record.value.size());
 }
 
-// 检查是否需要切换新 segment。
 Status KVStore::RotateIfNeeded(uint32_t incoming_record_size) {
     if (active_file_ == nullptr) {
         return Status::IOError("active file is null");
@@ -253,7 +442,6 @@ Status KVStore::RotateIfNeeded(uint32_t incoming_record_size) {
     return RotateActiveFile();
 }
 
-// 创建新的 active segment。
 Status KVStore::RotateActiveFile() {
     if (active_file_ == nullptr) {
         return Status::IOError("active file is null");
@@ -277,7 +465,6 @@ Status KVStore::RotateActiveFile() {
     return Status::OK();
 }
 
-// 追加记录并更新索引信息。
 Status KVStore::AppendRecord(const LogRecord& record, IndexEntry* entry) {
     if (!active_file_) {
         return Status::IOError("active file is null");
@@ -315,7 +502,6 @@ Status KVStore::AppendRecord(const LogRecord& record, IndexEntry* entry) {
     return Status::OK();
 }
 
-// 写入 key/value。
 Status KVStore::Put(const std::string& key, const std::string& value) {
     if (!opened_) {
         return Status::IOError("db not open");
@@ -340,7 +526,6 @@ Status KVStore::Put(const std::string& key, const std::string& value) {
     return Status::OK();
 }
 
-// 读取 key。
 Status KVStore::Get(const std::string& key, std::string* value) {
     if (!opened_) {
         return Status::IOError("db not open");
@@ -374,7 +559,6 @@ Status KVStore::Get(const std::string& key, std::string* value) {
     return Status::OK();
 }
 
-// 删除 key。
 Status KVStore::Delete(const std::string& key) {
     if (!opened_) {
         return Status::IOError("db not open");
@@ -389,7 +573,6 @@ Status KVStore::Delete(const std::string& key) {
     record.type = RecordType::kDelete;
     record.timestamp = static_cast<uint64_t>(std::time(nullptr));
     record.key = key;
-    record.value.clear();
 
     IndexEntry entry;
     Status s = AppendRecord(record, &entry);
@@ -409,7 +592,6 @@ Status KVStore::Merge() {
         return Status::IOError("active file is null");
     }
 
-    // 先构造 merged 文件及新索引；成功后再替换现有状态。
     const uint32_t merged_file_id = active_file_id_ + 1;
     auto merged_file = std::make_unique<DataFile>(merged_file_id, BuildDataFilePath(merged_file_id));
     Status s = merged_file->Open(true);
@@ -419,6 +601,12 @@ Status KVStore::Merge() {
 
     std::unordered_map<std::string, IndexEntry> compacted_index;
     compacted_index.reserve(index_.size());
+    struct HintRecord {
+        std::string key;
+        IndexEntry entry;
+    };
+    std::vector<HintRecord> hint_records;
+    hint_records.reserve(index_.size());
 
     for (const auto& [key, entry] : index_) {
         auto file_it = data_files_.find(entry.file_id);
@@ -454,7 +642,9 @@ Status KVStore::Merge() {
         new_entry.value_size = static_cast<uint32_t>(record.value.size());
         new_entry.timestamp = record.timestamp;
         new_entry.tombstone = false;
+
         compacted_index[key] = new_entry;
+        hint_records.push_back(HintRecord{key, new_entry});
     }
 
     s = merged_file->Sync();
@@ -467,7 +657,33 @@ Status KVStore::Merge() {
         return s;
     }
 
-    // 关闭并清理旧 segment 文件。
+    {
+        std::ofstream hint_out(BuildHintFilePath(merged_file_id), std::ios::binary | std::ios::trunc);
+        if (!hint_out.is_open()) {
+            return Status::IOError("failed to create hint file");
+        }
+
+        const uint32_t entry_count = static_cast<uint32_t>(hint_records.size());
+        hint_out.write(reinterpret_cast<const char*>(&kHintMagic), sizeof(kHintMagic));
+        hint_out.write(reinterpret_cast<const char*>(&kFormatVersion), sizeof(kFormatVersion));
+        hint_out.write(reinterpret_cast<const char*>(&merged_file_id), sizeof(merged_file_id));
+        hint_out.write(reinterpret_cast<const char*>(&entry_count), sizeof(entry_count));
+
+        for (const auto& hint : hint_records) {
+            const uint32_t key_size = static_cast<uint32_t>(hint.key.size());
+            hint_out.write(reinterpret_cast<const char*>(&key_size), sizeof(key_size));
+            hint_out.write(hint.key.data(), static_cast<std::streamsize>(hint.key.size()));
+            hint_out.write(reinterpret_cast<const char*>(&hint.entry.offset), sizeof(hint.entry.offset));
+            hint_out.write(reinterpret_cast<const char*>(&hint.entry.record_size), sizeof(hint.entry.record_size));
+            hint_out.write(reinterpret_cast<const char*>(&hint.entry.value_size), sizeof(hint.entry.value_size));
+            hint_out.write(reinterpret_cast<const char*>(&hint.entry.timestamp), sizeof(hint.entry.timestamp));
+        }
+
+        if (!hint_out) {
+            return Status::IOError("failed to write hint file");
+        }
+    }
+
     for (auto& [file_id, file] : data_files_) {
         (void)file_id;
         s = file->Close();
@@ -482,6 +698,7 @@ Status KVStore::Merge() {
         if (ec) {
             return Status::IOError("failed to remove old data file: " + ec.message());
         }
+        std::filesystem::remove(BuildHintFilePath(file_id), ec);
     }
 
     data_files_.clear();
@@ -499,19 +716,22 @@ Status KVStore::Merge() {
     ordered_file_ids_.push_back(merged_file_id);
     active_file_id_ = merged_file_id;
     index_ = std::move(compacted_index);
-    return Status::OK();
+
+    return SaveIndexSnapshot();
 }
 
-// 扫描所有 segment 做恢复。
 Status KVStore::Recover() {
-    // 恢复策略（分层处理）：
-    // 1) 按 file_id 升序扫描，保证“后写入覆盖先写入”的时序正确；
-    // 2) 每个文件从 offset=0 顺序读取记录；
-    // 3) 读失败时统一交给 HandleRecoverReadFailure：
-    //    - 可恢复尾部错误：截断后结束当前文件扫描，继续后续文件；
-    //    - 其他错误：立即失败并返回；
-    // 4) 读成功后统一交给 ApplyRecoveredRecord 更新内存索引。
     for (uint32_t file_id : ordered_file_ids_) {
+        if (file_id != active_file_id_) {
+            Status hint_status = RecoverFromHintFile(file_id);
+            if (hint_status.ok()) {
+                continue;
+            }
+            if (hint_status.code() != Status::kNotFound) {
+                return hint_status;
+            }
+        }
+
         auto it = data_files_.find(file_id);
         if (it == data_files_.end()) {
             return Status::Corruption("missing file while recover");
