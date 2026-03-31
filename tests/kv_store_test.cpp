@@ -1,4 +1,17 @@
 // tests/kv_store_test.cpp
+//
+// KVStore 集成测试。
+// 采用轻量级的自定义断言宏（无需 Google Test 等第三方框架），
+// 每个测试函数独立使用隔离目录，测试结束后统一汇报通过/失败数量。
+//
+// 测试分类：
+//  - 基础功能：Put/Get/Delete、覆盖写、空 key、不存在 key 等。
+//  - 崩溃恢复：重启后重建索引、多版本覆盖、删除后恢复等。
+//  - 多 segment：segment rotate 及跨 segment 恢复。
+//  - 数据完整性：CRC 检测、bad magic、bad record type、尾部半条记录截断等。
+//  - Merge/Compaction：存活 key 保留、hint 文件生成、空库 merge 等。
+//  - Index Snapshot：Close 时快照生成验证。
+
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -11,9 +24,11 @@
 
 namespace fs = std::filesystem;
 
+// 全局测试计数器，main() 结束时汇总输出。
 static int g_passed = 0;
 static int g_failed = 0;
 
+/// @brief 断言表达式为真，失败时打印位置信息、递增失败计数并从当前测试函数返回。
 #define ASSERT_TRUE(expr)                                                     \
     do {                                                                      \
         if (!(expr)) {                                                        \
@@ -25,6 +40,7 @@ static int g_failed = 0;
         }                                                                     \
     } while (0)
 
+/// @brief 断言两个值相等，失败时同时打印两个值的实际内容。
 #define ASSERT_EQ(lhs, rhs)                                                   \
     do {                                                                      \
         auto _lhs = (lhs);                                                    \
@@ -39,6 +55,7 @@ static int g_failed = 0;
         }                                                                     \
     } while (0)
 
+/// @brief 断言 Status 为 OK，失败时打印具体错误信息。
 #define ASSERT_STATUS_OK(status_expr)                                         \
     do {                                                                      \
         Status _s = (status_expr);                                            \
@@ -52,6 +69,7 @@ static int g_failed = 0;
         }                                                                     \
     } while (0)
 
+/// @brief 断言 Status 的错误码等于 expected_code，失败时打印实际错误码。
 #define ASSERT_STATUS_CODE(status_expr, expected_code)                        \
     do {                                                                      \
         Status _s = (status_expr);                                            \
@@ -66,17 +84,20 @@ static int g_failed = 0;
         }                                                                     \
     } while (0)
 
+/// @brief 标记测试通过，输出测试函数名并递增通过计数。
 static void PassTest(const std::string& name) {
     std::cout << "[PASSED] " << name << std::endl;
     ++g_passed;
 }
 
+/// @brief 清空并重新创建测试目录，确保每个测试在干净的环境中运行。
 static void CleanDir(const std::string& path) {
     std::error_code ec;
     fs::remove_all(path, ec);
     fs::create_directories(path, ec);
 }
 
+/// @brief 构造测试用 Options：使用指定路径，关闭每写 sync（提高测试速度）。
 static Options MakeOptions(const std::string& path) {
     Options opt;
     opt.db_path = path;
@@ -84,18 +105,24 @@ static Options MakeOptions(const std::string& path) {
     return opt;
 }
 
+/// @brief 构造指定目录和 file_id 的 segment 文件路径（测试辅助）。
 static std::string DataFilePath(const std::string& db_path, uint32_t file_id = 1) {
     return db_path + "/data_" + std::to_string(file_id) + ".log";
 }
 
+/// @brief 构造指定目录和 file_id 的 hint 文件路径（测试辅助）。
 static std::string HintFilePath(const std::string& db_path, uint32_t file_id) {
     return db_path + "/hint_" + std::to_string(file_id) + ".hint";
 }
 
+/// @brief 构造 index snapshot 文件路径（测试辅助）。
 static std::string SnapshotPath(const std::string& db_path) {
     return db_path + "/index.snapshot";
 }
 
+/// @brief 统计目录下 data_*.log 文件的数量（测试辅助）。
+/// 用于验证 segment 数量是否符合预期（如 rotate 或 merge 后）。
+/// @return 文件数量，目录遍历失败时返回 -1。
 static int CountDataFiles(const std::string& db_path) {
     std::error_code ec;
     int count = 0;
@@ -116,6 +143,9 @@ static int CountDataFiles(const std::string& db_path) {
 
 // 把文件某个位置的一个字节翻转，用于模拟磁盘数据损坏。
 // 这比直接覆盖成固定值更稳，因为基本能保证 CRC 改变。
+// @param file_path 要修改的文件路径。
+// @param offset    要翻转的字节偏移（0 表示文件第一个字节）。
+// @return 成功翻转返回 true，文件打开失败或偏移越界返回 false。
 static bool FlipOneByte(const std::string& file_path, std::streamoff offset) {
     std::fstream file(file_path, std::ios::in | std::ios::out | std::ios::binary);
     if (!file.is_open()) {
@@ -143,8 +173,11 @@ static bool FlipOneByte(const std::string& file_path, std::streamoff offset) {
     return static_cast<bool>(file);
 }
 
-// 截断文件末尾若干字节，用于模拟“尾部半条记录”。
+// 截断文件末尾若干字节，用于模拟“尾部半条记录”（进程崩溃时的典型场景）。
 // Windows 下 std::filesystem::resize_file 可直接用。
+// @param file_path      要截断的文件路径。
+// @param bytes_to_remove 从文件末尾移除的字节数。
+// @return 成功截断返回 true，文件不存在、大小不足或 resize 失败返回 false。
 static bool TruncateFileTail(const std::string& file_path, std::uintmax_t bytes_to_remove) {
     std::error_code ec;
     std::uintmax_t size = fs::file_size(file_path, ec);
@@ -156,6 +189,7 @@ static bool TruncateFileTail(const std::string& file_path, std::uintmax_t bytes_
     return !ec;
 }
 
+/// @brief 基础读写测试：Put 两个 key，验证 Get 返回正确值，并正常 Close。
 void TestPutAndGet() {
     const std::string path = "./testdata/test_put_get_crc";
     CleanDir(path);
@@ -177,6 +211,7 @@ void TestPutAndGet() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 覆盖写测试：同一 key 写入三个版本，验证 Get 返回最新值 v3。
 void TestOverwrite() {
     const std::string path = "./testdata/test_overwrite_crc";
     CleanDir(path);
@@ -196,6 +231,7 @@ void TestOverwrite() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 删除测试：Put 后 Delete，验证 Get 返回 kNotFound。
 void TestDelete() {
     const std::string path = "./testdata/test_delete_crc";
     CleanDir(path);
@@ -213,6 +249,7 @@ void TestDelete() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 删除不存在 key 的测试：期望返回 kNotFound 而不是崩溃。
 void TestDeleteNonExistentKey() {
     const std::string path = "./testdata/test_delete_non_existent_crc";
     CleanDir(path);
@@ -226,6 +263,7 @@ void TestDeleteNonExistentKey() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 重启恢复测试：写入数据、关闭后重新打开，验证索引从 segment 或 snapshot 正确恢复。
 void TestRecoveryAfterReopen() {
     const std::string path = "./testdata/test_recovery_reopen_crc";
     CleanDir(path);
@@ -256,6 +294,7 @@ void TestRecoveryAfterReopen() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 覆盖写恢复测试：写入三个版本关闭后重启，验证恢复到最新版本 v3。
 void TestRecoveryWithOverwrite() {
     const std::string path = "./testdata/test_recovery_overwrite_crc";
     CleanDir(path);
@@ -284,6 +323,7 @@ void TestRecoveryWithOverwrite() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 删除后恢复测试：Put 两个 key、Delete 其中一个，关闭重启后验证被删 key 不可见。
 void TestRecoveryWithDelete() {
     const std::string path = "./testdata/test_recovery_delete_crc";
     CleanDir(path);
@@ -314,6 +354,7 @@ void TestRecoveryWithDelete() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 空 key 测试：Put 空字符串 key 应返回 kInvalidArgument，拒绝写入。
 void TestEmptyKey() {
     const std::string path = "./testdata/test_empty_key_crc";
     CleanDir(path);
@@ -327,6 +368,7 @@ void TestEmptyKey() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 查询不存在 key 的测试：Get 一个从未写入的 key，期望返回 kNotFound。
 void TestGetNonExistentKey() {
     const std::string path = "./testdata/test_get_non_existent_crc";
     CleanDir(path);
@@ -342,6 +384,7 @@ void TestGetNonExistentKey() {
 }
 
 // 新增：验证 CRC 正常路径下，大 value 也可以正确恢复。
+/// @brief 大 value 恢复测试：写入 4096 字节的 value，关闭重启后验证完整读回。
 void TestRecoveryWithLargeValue() {
     const std::string path = "./testdata/test_large_value_crc";
     CleanDir(path);
@@ -370,6 +413,7 @@ void TestRecoveryWithLargeValue() {
 }
 
 // 新增：手工破坏 magic 字段，期望下次 Open() 时恢复失败，返回 Corruption（格式损坏）。
+/// @brief bad magic 检测测试：翻转文件首字节破坏 magic，Open 后期望返回 kCorruption。
 void TestCRCDetectsCorruptionOnOpen() {
     const std::string path = "./testdata/test_crc_detect_open";
     CleanDir(path);
@@ -400,6 +444,8 @@ void TestCRCDetectsCorruptionOnOpen() {
 // 新增：模拟尾部半条记录。
 // 当前 Recover() 里如果遇到 IOError，会 break 并停止恢复。
 // 所以预期是：Open() 仍然成功，且至少前面的完整记录仍可读。
+/// @brief 活跃 segment 尾部截断恢复测试：截掉最后 3 字节模拟崩溃，
+///        验证 Open 成功且前面的完整记录仍然可读。
 void TestRecoveryStopsAtPartialTailRecord() {
     const std::string path = "./testdata/test_partial_tail_crc";
     CleanDir(path);
@@ -435,6 +481,8 @@ void TestRecoveryStopsAtPartialTailRecord() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 多 segment rotate 及恢复测试：设置极小的 max_data_file_size 触发 rotate，
+///        验证多个 segment 写入后重启能正确恢复所有 key。
 void TestMultiSegmentRotationAndRecovery() {
     const std::string path = "./testdata/test_multi_segment_rotation";
     CleanDir(path);
@@ -471,6 +519,8 @@ void TestMultiSegmentRotationAndRecovery() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 旧 segment 尾部截断后继续恢复测试：
+///        人为截断第一个 segment 的末尾，验证恢复时跳过损坏部分并继续处理后续 segment。
 void TestRecoverContinuesAfterPartialTailInOldSegment() {
     const std::string path = "./testdata/test_recover_partial_old_segment";
     CleanDir(path);
@@ -515,6 +565,7 @@ void TestRecoverContinuesAfterPartialTailInOldSegment() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 打开不存在路径的测试：以只读模式打开不存在的文件，期望返回 kIOError。
 void TestOpenFailureReturnsIOError() {
     const std::string bad_path = "./testdata/not_exist_dir/data_1.log";
     std::error_code ec;
@@ -527,6 +578,7 @@ void TestOpenFailureReturnsIOError() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 越界读取测试：在有效记录之外的偏移调用 Read，期望返回 kOutOfRange。
 void TestReadOutOfRangeReturnsOutOfRange() {
     const std::string path = "./testdata/test_read_out_of_range";
     CleanDir(path);
@@ -554,6 +606,7 @@ void TestReadOutOfRangeReturnsOutOfRange() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief CRC 校验失败测试：翻转 value 区域一个字节，Open 时期望返回 kChecksumFailed。
 void TestChecksumFailureReturnsChecksumFailed() {
     const std::string path = "./testdata/test_checksum_failed_code";
     CleanDir(path);
@@ -579,6 +632,7 @@ void TestChecksumFailureReturnsChecksumFailed() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 非法记录类型测试：翻转 type 字段字节，Open 时期望返回 kCorruption。
 void TestInvalidRecordTypeReturnsCorruption() {
     const std::string path = "./testdata/test_invalid_record_type";
     CleanDir(path);
@@ -604,6 +658,8 @@ void TestInvalidRecordTypeReturnsCorruption() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief Merge 保留存活 key 测试：写入多版本和 tombstone，Merge 后验证只剩最新存活 key，
+///        且 Close + 重启后状态一致。
 void TestMergeCompactionKeepsOnlyLiveKeys() {
     const std::string path = "./testdata/test_merge_compaction_live_keys";
     CleanDir(path);
@@ -656,6 +712,7 @@ void TestMergeCompactionKeepsOnlyLiveKeys() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 空库 Merge 测试：对没有任何写入的数据库调用 Merge，期望不报错且 segment 数量为 1。
 void TestMergeOnEmptyDatabase() {
     const std::string path = "./testdata/test_merge_empty_db";
     CleanDir(path);
@@ -670,6 +727,7 @@ void TestMergeOnEmptyDatabase() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief Merge 生成 hint 文件测试：Merge 后验证磁盘上存在对应的 .hint 文件。
 void TestMergeCreatesHintFile() {
     const std::string path = "./testdata/test_merge_creates_hint";
     CleanDir(path);
@@ -689,6 +747,7 @@ void TestMergeCreatesHintFile() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief Close 生成 index snapshot 测试：正常写入并 Close 后，验证 index.snapshot 文件存在。
 void TestCloseCreatesIndexSnapshot() {
     const std::string path = "./testdata/test_close_creates_snapshot";
     CleanDir(path);
@@ -704,6 +763,8 @@ void TestCloseCreatesIndexSnapshot() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 测试入口：按顺序运行所有测试函数，最终汇总通过/失败数量。
+/// 若有任何失败则以非零退出码退出，便于 CI 检测。
 int main() {
     TestPutAndGet();
     TestOverwrite();

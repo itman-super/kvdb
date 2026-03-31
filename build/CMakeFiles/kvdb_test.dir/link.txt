@@ -1,1 +1,0 @@
-/usr/bin/c++ -g -Wl,--dependency-file=CMakeFiles/kvdb_test.dir/link.d CMakeFiles/kvdb_test.dir/tests/kv_store_test.cpp.o CMakeFiles/kvdb_test.dir/src/kv_store.cpp.o CMakeFiles/kvdb_test.dir/src/data_file.cpp.o -o bin/kvdb_test

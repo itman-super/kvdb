@@ -1,4 +1,10 @@
 // src/data_file.cpp
+//
+// DataFile 实现文件。
+// 每个 DataFile 对应磁盘上一个 segment 文件（data_<id>.log）。
+// 所有读写均使用 std::fstream 完成，sync 则通过单独的原生文件描述符
+// (sync_fd_) 调用 fsync/fdatasync 实现，以避免 C++ 流层无法直接 sync 的问题。
+
 #include "data_file.h"
 
 #include <cstring>
@@ -30,11 +36,21 @@ constexpr std::size_t kHeaderSize =
     sizeof(uint32_t) +   // value_size
     sizeof(uint32_t);    // crc
 
+/// @brief 将固定大小的 POD 值以原始字节追加到字符串末尾（小端序存储）。
+/// @tparam T  任意平凡可复制类型（uint32_t、uint64_t 等）。
+/// @param out  目标字符串，字节追加到其末尾。
+/// @param value 要追加的值。
 template <typename T>
 void AppendFixed(std::string* out, const T& value) {
     out->append(reinterpret_cast<const char*>(&value), sizeof(T));
 }
 
+/// @brief 从缓冲区当前位置读取一个固定大小的 POD 值，并将 pos 向后推进。
+/// @tparam T  目标类型。
+/// @param buf  源字节缓冲。
+/// @param pos  当前读取位置（in/out），读取成功后会前移 sizeof(T) 字节。
+/// @param value 读出的值写入此处。
+/// @return 若剩余字节不足则返回 false，否则返回 true。
 template <typename T>
 bool ReadFixed(const std::string& buf, std::size_t* pos, T* value) {
     if (*pos + sizeof(T) > buf.size()) {
@@ -45,6 +61,15 @@ bool ReadFixed(const std::string& buf, std::size_t* pos, T* value) {
     return true;
 }
 
+/// @brief 增量更新 CRC-32 校验值（Castagnoli 多项式 0xEDB88320，ISO 3309 标准）。
+///
+/// 采用逐位运算实现，无需查找表，避免静态初始化开销。
+/// 调用前将 crc 初始化为 0，函数内部会自动取反处理（~crc 进入，~crc 返回）。
+///
+/// @param crc  当前累积 CRC 值（初始调用传 0）。
+/// @param data 待校验数据指针。
+/// @param len  数据长度（字节）。
+/// @return 更新后的 CRC-32 值。
 // CRC32 实现（无外部依赖）
 uint32_t CRC32Update(uint32_t crc, const char* data, std::size_t len) {
     crc = ~crc;
@@ -61,11 +86,28 @@ uint32_t CRC32Update(uint32_t crc, const char* data, std::size_t len) {
     return ~crc;
 }
 
+/// @brief 对单个固定大小 POD 值进行 CRC-32 增量计算的便捷重载。
+/// @tparam T  POD 类型。
+/// @param crc  当前累积 CRC 值。
+/// @param value 待纳入校验的值。
+/// @return 更新后的 CRC-32 值。
 template <typename T>
 uint32_t CRC32UpdateFixed(uint32_t crc, const T& value) {
     return CRC32Update(crc, reinterpret_cast<const char*>(&value), sizeof(T));
 }
 
+/// @brief 计算一条完整日志记录的 CRC-32 校验值。
+///
+/// 覆盖范围：type | timestamp | key_size | value_size | key bytes | value bytes。
+/// magic 字段不纳入 CRC，以便在磁盘损坏时通过 magic 和 CRC 分别定位不同类型的错误。
+///
+/// @param type        记录类型（kPut / kDelete）。
+/// @param timestamp   写入时间戳。
+/// @param key_size    key 字节数。
+/// @param value_size  value 字节数。
+/// @param key_data    key 数据指针（key_size == 0 时可为 nullptr）。
+/// @param value_data  value 数据指针（value_size == 0 时可为 nullptr）。
+/// @return 计算得到的 CRC-32 值。
 // 计算一条记录的 CRC：
 // 覆盖 type | timestamp | key_size | value_size | key | value
 uint32_t ComputeRecordCRC(uint8_t type,
@@ -90,6 +132,13 @@ uint32_t ComputeRecordCRC(uint8_t type,
 }
 
 #ifndef _WIN32
+/// @brief 在 POSIX 平台上对文件所在目录执行 fsync，确保目录项（文件名）持久化。
+///
+/// 新建文件后首次写入时需要 sync 目录，否则在宕机重启后目录项可能尚未落盘，
+/// 导致文件"消失"。只在 need_dir_sync_ == true 时调用一次，之后置为 false。
+///
+/// @param file_path 数据文件的完整路径，函数会从中提取父目录。
+/// @return 成功返回 Status::OK()，失败返回 IOError。
 Status SyncDirectoryIfNeeded(const std::string& file_path) {
     std::error_code ec;
     const std::filesystem::path dir_path = std::filesystem::path(file_path).parent_path();
@@ -119,13 +168,27 @@ Status SyncDirectoryIfNeeded(const std::string& file_path) {
 
 }  // namespace
 
+/// @brief 构造 DataFile 对象，仅记录文件 ID 和路径，不打开文件。
+/// 调用方必须显式调用 Open() 才能进行实际读写。
 DataFile::DataFile(uint32_t file_id, std::string file_path)
     : file_id_(file_id), file_path_(std::move(file_path)) {}
 
+/// @brief 析构时自动关闭文件句柄，释放 fstream 和 sync_fd_ 资源。
 DataFile::~DataFile() {
     Close();
 }
 
+/// @brief 打开底层文件，并根据 writable 参数决定是否同时支持写入。
+///
+/// 打开策略：
+///  1. 若文件已打开则直接返回 OK（幂等）。
+///  2. 以 binary + in 模式打开；若 writable == true，追加 out 模式。
+///  3. 若以可写模式打开时文件不存在，先创建空文件再重新打开（两步法）。
+///     此时标记 need_dir_sync_ = true，下次 Sync() 时会对目录执行 fsync。
+///  4. 成功后为可写文件额外打开一个原生 fd（sync_fd_），用于后续 fsync/fdatasync。
+///
+/// @param writable true 表示需要读写，false 表示只读。
+/// @return 成功返回 Status::OK()，失败返回 IOError。
 Status DataFile::Open(bool writable) {
     writable_ = writable;
 
@@ -170,6 +233,12 @@ Status DataFile::Open(bool writable) {
     return Status::OK();
 }
 
+/// @brief 关闭文件句柄，先关闭 sync_fd_（原生 fd），再 flush 并关闭 fstream。
+///
+/// 可以安全地多次调用（幂等）：若文件已关闭则静默返回 OK。
+/// 析构函数会自动调用此方法，因此不必担心泄漏。
+///
+/// @return 成功返回 Status::OK()，失败返回 IOError。
 Status DataFile::Close() {
 #ifdef _WIN32
     if (sync_fd_ >= 0) {
@@ -190,6 +259,18 @@ Status DataFile::Close() {
     return Status::OK();
 }
 
+/// @brief 将用户态缓冲区刷入内核，并调用 fsync/fdatasync 确保数据持久化到磁盘。
+///
+/// 步骤：
+///  1. 调用 fstream::flush() 将 C++ 流缓冲写入操作系统内核缓冲区。
+///  2. 通过 sync_fd_（原生 fd）调用平台特定的 sync 系统调用：
+///     - Windows：_commit()
+///     - macOS：fsync()（fdatasync 在 macOS 上不完整）
+///     - 其他 POSIX：fdatasync()（不同步 metadata，性能更好）
+///  3. 若为新建文件（need_dir_sync_ == true），额外对目录执行 fsync，
+///     确保目录项持久化后再清除该标志。
+///
+/// @return 成功返回 Status::OK()，失败返回 IOError。
 Status DataFile::Sync() {
     if (!file_.is_open()) {
         return Status::IOError("file not open");
@@ -236,6 +317,13 @@ Status DataFile::Sync() {
     return Status::OK();
 }
 
+/// @brief 返回文件当前大小（字节数）。
+///
+/// 通过 seekg 到文件末尾再 tellg 实现，不依赖 stat 系统调用，
+/// 因此对跨平台（Windows/POSIX）均适用。
+/// 若文件未打开或 seek 失败则返回 0，调用方应将 0 视为"无法获取尺寸"。
+///
+/// @return 文件字节数，失败返回 0。
 uint64_t DataFile::Size() {
     if (!file_.is_open()) {
         return 0;
@@ -255,6 +343,14 @@ uint64_t DataFile::Size() {
     return static_cast<uint64_t>(pos);
 }
 
+/// @brief 向文件当前写指针位置写入 len 字节的原始数据。
+///
+/// 这是所有写操作的最终底层调用，fstream 内部维护写指针位置，
+/// 上层 Append() 在调用前会先 seekp 到文件末尾。
+///
+/// @param data 源数据指针。
+/// @param len  写入字节数。
+/// @return 成功返回 Status::OK()，失败返回 IOError。
 Status DataFile::WriteBytes(const char* data, std::size_t len) {
     if (!file_.is_open()) {
         return Status::IOError("file not open");
@@ -267,6 +363,16 @@ Status DataFile::WriteBytes(const char* data, std::size_t len) {
     return Status::OK();
 }
 
+/// @brief 从指定偏移量读取 len 字节的原始数据。
+///
+/// 读取前会先进行边界校验（offset + len <= file_size），避免在 EOF 处
+/// 才发现读取失败的情况，使错误更早、更清晰地暴露为 OutOfRange 而非 IOError。
+/// seekg 后若流状态异常（如流已损坏），也会返回 IOError。
+///
+/// @param offset 文件内起始偏移（字节）。
+/// @param data   目标缓冲区指针，调用方负责保证至少 len 字节可写。
+/// @param len    需要读取的字节数。
+/// @return 成功返回 Status::OK()，offset 越界返回 OutOfRange，其他失败返回 IOError。
 Status DataFile::ReadBytes(uint64_t offset, char* data, std::size_t len) {
     if (!file_.is_open()) {
         return Status::IOError("file not open");
@@ -300,6 +406,17 @@ Status DataFile::ReadBytes(uint64_t offset, char* data, std::size_t len) {
     return Status::OK();
 }
 
+/// @brief 将逻辑 LogRecord 编码为二进制字节序列（用于追加写入磁盘）。
+///
+/// 编码格式（固定头 + 可变体）：
+///   [magic: 4B][type: 1B][timestamp: 8B][key_size: 4B][value_size: 4B][crc: 4B]
+///   [key: key_size B][value: value_size B]
+///
+/// CRC 覆盖 type、timestamp、key_size、value_size 以及 key/value 内容，
+/// 不覆盖 magic（magic 损坏时通过魔数校验单独检测）。
+///
+/// @param record 要编码的逻辑记录。
+/// @return 编码后的二进制字节串。
 std::string DataFile::EncodeRecord(const LogRecord& record) {
     std::string out;
     out.reserve(kHeaderSize + record.key.size() + record.value.size());
@@ -331,6 +448,19 @@ std::string DataFile::EncodeRecord(const LogRecord& record) {
     return out;
 }
 
+/// @brief 将二进制缓冲区解码为 LogRecord，并完成完整性验证。
+///
+/// 解码步骤：
+///  1. 检查缓冲区长度至少为 kHeaderSize。
+///  2. 依次读取各头部字段（magic、type、timestamp、key_size、value_size、crc）。
+///  3. 验证 magic 值匹配 kMagic。
+///  4. 验证 type 为合法值（kPut 或 kDelete），其他值视为格式损坏。
+///  5. 验证缓冲区总长度等于 kHeaderSize + key_size + value_size。
+///  6. 重新计算 CRC 并与存储值对比，不一致则返回 ChecksumFailed。
+///
+/// @param buf    完整的序列化记录字节串（头部 + payload）。
+/// @param record 解码后的逻辑记录写入此处。
+/// @return 成功返回 Status::OK()，格式损坏返回 Corruption，CRC 不符返回 ChecksumFailed。
 Status DataFile::DecodeRecord(const std::string& buf, LogRecord* record) {
     if (buf.size() < kHeaderSize) {
         return Status::Corruption("record too small");
@@ -391,6 +521,19 @@ Status DataFile::DecodeRecord(const std::string& buf, LogRecord* record) {
     return Status::OK();
 }
 
+/// @brief 将一条逻辑记录追加到文件末尾，并返回写入位置和大小。
+///
+/// 流程：
+///  1. 调用 EncodeRecord() 将记录序列化为字节串。
+///  2. seekp 到文件末尾，记录当前偏移（即本条记录起始位置）。
+///  3. 调用 WriteBytes() 写入字节数据。
+///  4. 将起始偏移和写入字节数通过输出参数返回给调用方，
+///     调用方（AppendRecord）会据此更新内存索引。
+///
+/// @param record       要追加的逻辑记录。
+/// @param offset       [out] 本条记录在文件中的起始偏移（字节），可为 nullptr。
+/// @param written_size [out] 实际写入的字节数，可为 nullptr。
+/// @return 成功返回 Status::OK()，失败返回 IOError。
 Status DataFile::Append(const LogRecord& record, uint64_t* offset, uint32_t* written_size) {
     if (!file_.is_open()) {
         return Status::IOError("file not open");
@@ -424,6 +567,21 @@ Status DataFile::Append(const LogRecord& record, uint64_t* offset, uint32_t* wri
     return Status::OK();
 }
 
+/// @brief 从指定偏移读取一条完整的日志记录（包括头部与 payload）。
+///
+/// 采用两次读取策略以减少不必要的内存分配：
+///  1. 先读取固定大小的头部（kHeaderSize 字节），解析出 key_size 和 value_size。
+///  2. 再读取 payload（key + value），最终调用 DecodeRecord 做完整校验。
+///
+/// 防御性检查：
+///  - key_size + value_size 可能整数溢出，使用 uint64_t 中间变量防范。
+///  - total_size 超过 uint32_t 范围时返回 Corruption（单条记录不应如此巨大）。
+///
+/// @param offset      从此文件偏移开始读取（字节）。
+/// @param record      [out] 解码后的逻辑记录写入此处，不得为 nullptr。
+/// @param record_size [out] 本条记录占用的总字节数（头部 + payload），可为 nullptr。
+/// @return 成功返回 Status::OK()；偏移越界返回 OutOfRange；格式损坏返回 Corruption；
+///         CRC 不符返回 ChecksumFailed；其他 I/O 失败返回 IOError。
 Status DataFile::Read(uint64_t offset, LogRecord* record, uint32_t* record_size) {
     if (record == nullptr) {
         return Status::InvalidArgument("record output is null");
@@ -489,6 +647,14 @@ Status DataFile::Read(uint64_t offset, LogRecord* record, uint32_t* record_size)
 
     return Status::OK();
 }
+/// @brief 将文件截断到指定大小，用于崩溃恢复时裁剪末尾的不完整记录。
+///
+/// 实现注意：直接对已打开的 fstream 调用 resize_file 在某些平台上可能失败
+/// （文件锁或流缓存未 flush），因此先 flush + close fstream，调用
+/// std::filesystem::resize_file 完成截断，再重新 Open 恢复可用状态。
+///
+/// @param size 截断后的目标文件大小（字节）。
+/// @return 成功返回 Status::OK()，失败返回 IOError。
 Status DataFile::Truncate(uint64_t size) {
     if (!file_.is_open()) {
         return Status::IOError("file not open");
