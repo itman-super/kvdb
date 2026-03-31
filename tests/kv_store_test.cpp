@@ -88,6 +88,14 @@ static std::string DataFilePath(const std::string& db_path, uint32_t file_id = 1
     return db_path + "/data_" + std::to_string(file_id) + ".log";
 }
 
+static std::string HintFilePath(const std::string& db_path, uint32_t file_id) {
+    return db_path + "/hint_" + std::to_string(file_id) + ".hint";
+}
+
+static std::string SnapshotPath(const std::string& db_path) {
+    return db_path + "/index.snapshot";
+}
+
 static int CountDataFiles(const std::string& db_path) {
     std::error_code ec;
     int count = 0;
@@ -662,6 +670,40 @@ void TestMergeOnEmptyDatabase() {
     PassTest(__FUNCTION__);
 }
 
+void TestMergeCreatesHintFile() {
+    const std::string path = "./testdata/test_merge_creates_hint";
+    CleanDir(path);
+
+    Options opt = MakeOptions(path);
+    opt.max_data_file_size = 80;
+
+    KVStore db(opt);
+    ASSERT_STATUS_OK(db.Open());
+    ASSERT_STATUS_OK(db.Put("k1", "v1"));
+    ASSERT_STATUS_OK(db.Put("k2", "v2"));
+    ASSERT_STATUS_OK(db.Merge());
+    ASSERT_TRUE(CountDataFiles(path) == 1);
+    ASSERT_TRUE(fs::exists(HintFilePath(path, 2)));
+    ASSERT_STATUS_OK(db.Close());
+
+    PassTest(__FUNCTION__);
+}
+
+void TestCloseCreatesIndexSnapshot() {
+    const std::string path = "./testdata/test_close_creates_snapshot";
+    CleanDir(path);
+
+    {
+        KVStore db(MakeOptions(path));
+        ASSERT_STATUS_OK(db.Open());
+        ASSERT_STATUS_OK(db.Put("k1", "v1"));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    ASSERT_TRUE(fs::exists(SnapshotPath(path)));
+    PassTest(__FUNCTION__);
+}
+
 int main() {
     TestPutAndGet();
     TestOverwrite();
@@ -684,6 +726,8 @@ int main() {
     TestInvalidRecordTypeReturnsCorruption();
     TestMergeCompactionKeepsOnlyLiveKeys();
     TestMergeOnEmptyDatabase();
+    TestMergeCreatesHintFile();
+    TestCloseCreatesIndexSnapshot();
 
     std::cout << "\n========== TEST SUMMARY ==========" << std::endl;
     std::cout << "PASSED: " << g_passed << std::endl;

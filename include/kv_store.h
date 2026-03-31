@@ -65,6 +65,22 @@ private:
     // 生成指定 file_id 的 segment 文件路径。
     std::string BuildDataFilePath(uint32_t file_id) const;
 
+    // 生成 index snapshot 文件路径。
+    std::string BuildIndexSnapshotPath() const;
+
+    // 生成指定 file_id 的 hint 文件路径。
+    std::string BuildHintFilePath(uint32_t file_id) const;
+
+    // 尝试加载 index snapshot；成功返回 true，失败返回 false（不视为错误）。
+    bool TryLoadIndexSnapshot();
+
+    // 将当前内存索引持久化为 snapshot。
+    Status SaveIndexSnapshot() const;
+
+    // 从 hint 文件恢复某个 segment 的索引记录。
+    // 仅适用于只包含 put 记录的 compacted segment。
+    Status RecoverFromHintFile(uint32_t file_id);
+
 private:
     Options options_;
 
