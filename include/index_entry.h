@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "log_record.h"
+
 // IndexEntry 表示内存索引中的一个条目。
 // Bitcask 风格核心思想：
 // - 磁盘上只追加写
@@ -21,8 +23,19 @@ struct IndexEntry {
     // value 的字节大小
     uint32_t value_size = 0;
 
+    // key 的字节大小
+    // 主要用于：
+    //  - 更快估算重写/merge 的写放大成本
+    //  - 调试时快速校验 key/value 元数据是否一致
+    uint32_t key_size = 0;
+
     // 写入时间戳
     uint64_t timestamp = 0;
+
+    // 该索引条目对应的记录类型（通常是 kPut）。
+    // 目前 index_ 默认不保留 tombstone，但在持久化/调试场景下保留类型信息，
+    // 为后续扩展（例如墓碑索引、TTL 索引）提供更丰富元数据。
+    RecordType record_type = RecordType::kPut;
 
     // 是否 tombstone
     // 第一版 index_ 中通常不保留已删除 key，这个字段主要为后续扩展准备

@@ -28,7 +28,7 @@ constexpr uint32_t kHintMagic = 0x4B564848;      // KVHH
 // index snapshot 文件魔数。
 constexpr uint32_t kSnapshotMagic = 0x4B565350;  // KVSP
 // 当前文件格式版本，加载时做兼容性检查。
-constexpr uint32_t kFormatVersion = 1;
+constexpr uint32_t kFormatVersion = 2;
 
 /// @brief 判断文件名是否匹配 data_<id>.log 格式，并解析出 file_id。
 ///
@@ -148,7 +148,7 @@ Status HandleRecoverReadFailure(DataFile* file,
 Status ApplyRecoveredRecord(uint32_t file_id,
                             uint64_t offset,
                             uint32_t record_size,
-                            const LogRecord& record,
+                            LogRecord record,
                             std::unordered_map<std::string, IndexEntry>* index) {
     if (index == nullptr) {
         return Status::InvalidArgument("index is null");
@@ -168,9 +168,11 @@ Status ApplyRecoveredRecord(uint32_t file_id,
     entry.offset = offset;
     entry.record_size = record_size;
     entry.value_size = static_cast<uint32_t>(record.value.size());
+    entry.key_size = static_cast<uint32_t>(record.key.size());
     entry.timestamp = record.timestamp;
+    entry.record_type = record.type;
     entry.tombstone = false;
-    (*index)[record.key] = entry;
+    index->insert_or_assign(std::move(record.key), entry);
     return Status::OK();
 }
 
@@ -349,7 +351,7 @@ bool KVStore::TryLoadIndexSnapshot() {
     in.read(reinterpret_cast<char*>(&file_count), sizeof(file_count));
     in.read(reinterpret_cast<char*>(&entry_count), sizeof(entry_count));
     in.read(reinterpret_cast<char*>(&snapshot_active_file_id), sizeof(snapshot_active_file_id));
-    if (!in || magic != kSnapshotMagic || version != kFormatVersion) {
+    if (!in || magic != kSnapshotMagic || (version != 1 && version != kFormatVersion)) {
         return false;
     }
 
@@ -410,7 +412,19 @@ bool KVStore::TryLoadIndexSnapshot() {
         in.read(reinterpret_cast<char*>(&entry.offset), sizeof(entry.offset));
         in.read(reinterpret_cast<char*>(&entry.record_size), sizeof(entry.record_size));
         in.read(reinterpret_cast<char*>(&entry.value_size), sizeof(entry.value_size));
+        if (version >= 2) {
+            in.read(reinterpret_cast<char*>(&entry.key_size), sizeof(entry.key_size));
+        } else {
+            entry.key_size = key_size;
+        }
         in.read(reinterpret_cast<char*>(&entry.timestamp), sizeof(entry.timestamp));
+        if (version >= 2) {
+            uint8_t stored_record_type = static_cast<uint8_t>(RecordType::kPut);
+            in.read(reinterpret_cast<char*>(&stored_record_type), sizeof(stored_record_type));
+            entry.record_type = static_cast<RecordType>(stored_record_type);
+        } else {
+            entry.record_type = RecordType::kPut;
+        }
         in.read(reinterpret_cast<char*>(&entry.tombstone), sizeof(entry.tombstone));
         if (!in) {
             return false;
@@ -470,7 +484,10 @@ Status KVStore::SaveIndexSnapshot() const {
         out.write(reinterpret_cast<const char*>(&entry.offset), sizeof(entry.offset));
         out.write(reinterpret_cast<const char*>(&entry.record_size), sizeof(entry.record_size));
         out.write(reinterpret_cast<const char*>(&entry.value_size), sizeof(entry.value_size));
+        out.write(reinterpret_cast<const char*>(&entry.key_size), sizeof(entry.key_size));
         out.write(reinterpret_cast<const char*>(&entry.timestamp), sizeof(entry.timestamp));
+        const uint8_t record_type = static_cast<uint8_t>(entry.record_type);
+        out.write(reinterpret_cast<const char*>(&record_type), sizeof(record_type));
         out.write(reinterpret_cast<const char*>(&entry.tombstone), sizeof(entry.tombstone));
     }
 
@@ -507,7 +524,8 @@ Status KVStore::RecoverFromHintFile(uint32_t file_id) {
     in.read(reinterpret_cast<char*>(&version), sizeof(version));
     in.read(reinterpret_cast<char*>(&hint_file_id), sizeof(hint_file_id));
     in.read(reinterpret_cast<char*>(&entry_count), sizeof(entry_count));
-    if (!in || magic != kHintMagic || version != kFormatVersion || hint_file_id != file_id) {
+    if (!in || magic != kHintMagic || (version != 1 && version != kFormatVersion) ||
+        hint_file_id != file_id) {
         return Status::Corruption("invalid hint file");
     }
 
@@ -529,7 +547,19 @@ Status KVStore::RecoverFromHintFile(uint32_t file_id) {
         in.read(reinterpret_cast<char*>(&entry.offset), sizeof(entry.offset));
         in.read(reinterpret_cast<char*>(&entry.record_size), sizeof(entry.record_size));
         in.read(reinterpret_cast<char*>(&entry.value_size), sizeof(entry.value_size));
+        if (version >= 2) {
+            in.read(reinterpret_cast<char*>(&entry.key_size), sizeof(entry.key_size));
+        } else {
+            entry.key_size = key_size;
+        }
         in.read(reinterpret_cast<char*>(&entry.timestamp), sizeof(entry.timestamp));
+        if (version >= 2) {
+            uint8_t stored_record_type = static_cast<uint8_t>(RecordType::kPut);
+            in.read(reinterpret_cast<char*>(&stored_record_type), sizeof(stored_record_type));
+            entry.record_type = static_cast<RecordType>(stored_record_type);
+        } else {
+            entry.record_type = RecordType::kPut;
+        }
         if (!in) {
             return Status::Corruption("invalid hint entry");
         }
@@ -657,7 +687,9 @@ Status KVStore::AppendRecord(const LogRecord& record, IndexEntry* entry) {
         entry->offset = offset;
         entry->record_size = written_size;
         entry->value_size = static_cast<uint32_t>(record.value.size());
+        entry->key_size = static_cast<uint32_t>(record.key.size());
         entry->timestamp = record.timestamp;
+        entry->record_type = record.type;
         entry->tombstone = (record.type == RecordType::kDelete);
     }
 
@@ -697,7 +729,7 @@ Status KVStore::Put(const std::string& key, const std::string& value) {
         return s;
     }
 
-    index_[key] = entry;
+    index_.insert_or_assign(std::move(record.key), entry);
     return Status::OK();
 }
 
@@ -742,7 +774,7 @@ Status KVStore::Get(const std::string& key, std::string* value) {
         return Status::NotFound("key deleted");
     }
 
-    *value = record.value;
+    *value = std::move(record.value);
     return Status::OK();
 }
 
@@ -853,7 +885,9 @@ Status KVStore::Merge() {
         new_entry.offset = new_offset;
         new_entry.record_size = new_size;
         new_entry.value_size = static_cast<uint32_t>(record.value.size());
+        new_entry.key_size = static_cast<uint32_t>(record.key.size());
         new_entry.timestamp = record.timestamp;
+        new_entry.record_type = record.type;
         new_entry.tombstone = false;
 
         compacted_index[key] = new_entry;
@@ -889,7 +923,10 @@ Status KVStore::Merge() {
             hint_out.write(reinterpret_cast<const char*>(&hint.entry.offset), sizeof(hint.entry.offset));
             hint_out.write(reinterpret_cast<const char*>(&hint.entry.record_size), sizeof(hint.entry.record_size));
             hint_out.write(reinterpret_cast<const char*>(&hint.entry.value_size), sizeof(hint.entry.value_size));
+            hint_out.write(reinterpret_cast<const char*>(&hint.entry.key_size), sizeof(hint.entry.key_size));
             hint_out.write(reinterpret_cast<const char*>(&hint.entry.timestamp), sizeof(hint.entry.timestamp));
+            const uint8_t record_type = static_cast<uint8_t>(hint.entry.record_type);
+            hint_out.write(reinterpret_cast<const char*>(&record_type), sizeof(record_type));
         }
 
         if (!hint_out) {
@@ -994,7 +1031,7 @@ Status KVStore::Recover() {
                 break;
             }
 
-            s = ApplyRecoveredRecord(file_id, offset, record_size, record, &index_);
+            s = ApplyRecoveredRecord(file_id, offset, record_size, std::move(record), &index_);
             if (!s.ok()) {
                 return s;
             }
