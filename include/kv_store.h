@@ -1,8 +1,10 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "data_file.h"
@@ -18,6 +20,25 @@
 // - 读取会按 index 中的 file_id 定位到对应文件
 class KVStore {
 public:
+    struct WriteBatchOp {
+        RecordType type = RecordType::kPut;
+        std::string key;
+        std::string value;
+    };
+
+    class Iterator {
+    public:
+        explicit Iterator(std::vector<std::pair<std::string, std::string>> items);
+        bool Valid() const;
+        void Next();
+        const std::string& Key() const;
+        const std::string& Value() const;
+
+    private:
+        std::vector<std::pair<std::string, std::string>> items_;
+        std::size_t index_ = 0;
+    };
+
     // 构造数据库对象。
     explicit KVStore(Options options);
 
@@ -39,6 +60,20 @@ public:
 
     // 删除 key（写入 tombstone）。
     Status Delete(const std::string& key);
+
+    // 批量写入：支持 put/delete 混合顺序执行。
+    Status WriteBatch(const std::vector<WriteBatchOp>& ops);
+
+    // 构造一个按 key 升序遍历的快照迭代器。
+    Status NewIterator(std::unique_ptr<Iterator>* iter);
+
+    // 按 key 升序扫描 prefix 前缀，最多返回 limit 条（0 表示不限）。
+    Status Scan(const std::string& prefix,
+                std::size_t limit,
+                std::vector<std::pair<std::string, std::string>>* result);
+
+    // 对全部 key-value 做一次 fold（按 key 升序）。
+    Status Fold(const std::function<Status(const std::string&, const std::string&)>& fn);
 
     // 手动触发 Merge/Compaction：
     // - 仅保留当前“存活”的 key 最新值
@@ -80,6 +115,9 @@ private:
     // 从 hint 文件恢复某个 segment 的索引记录。
     // 仅适用于只包含 put 记录的 compacted segment。
     Status RecoverFromHintFile(uint32_t file_id);
+
+    // 根据索引读取 value。
+    Status ReadValueByEntry(const IndexEntry& entry, std::string* value);
 
 private:
     Options options_;
