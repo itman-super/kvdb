@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <stdexcept>
 
 namespace {
 
@@ -177,6 +178,33 @@ Status ApplyRecoveredRecord(uint32_t file_id,
 }
 
 }  // namespace
+
+KVStore::Iterator::Iterator(std::vector<std::pair<std::string, std::string>> items)
+    : items_(std::move(items)) {}
+
+bool KVStore::Iterator::Valid() const {
+    return index_ < items_.size();
+}
+
+void KVStore::Iterator::Next() {
+    if (Valid()) {
+        ++index_;
+    }
+}
+
+const std::string& KVStore::Iterator::Key() const {
+    if (!Valid()) {
+        throw std::out_of_range("iterator is invalid");
+    }
+    return items_[index_].first;
+}
+
+const std::string& KVStore::Iterator::Value() const {
+    if (!Valid()) {
+        throw std::out_of_range("iterator is invalid");
+    }
+    return items_[index_].second;
+}
 
 /// @brief 构造 KVStore，仅保存配置项，不打开任何文件。
 /// 调用方必须显式调用 Open() 才能使用数据库。
@@ -758,24 +786,7 @@ Status KVStore::Get(const std::string& key, std::string* value) {
         return Status::NotFound("key not found");
     }
 
-    auto file_it = data_files_.find(it->second.file_id);
-    if (file_it == data_files_.end()) {
-        return Status::Corruption("index points to missing data file");
-    }
-
-    LogRecord record;
-    uint32_t record_size = 0;
-    Status s = file_it->second->Read(it->second.offset, &record, &record_size);
-    if (!s.ok()) {
-        return s;
-    }
-
-    if (record.type == RecordType::kDelete) {
-        return Status::NotFound("key deleted");
-    }
-
-    *value = std::move(record.value);
-    return Status::OK();
+    return ReadValueByEntry(it->second, value);
 }
 
 /// @brief 删除指定 key（通过写入 tombstone 记录实现）。
@@ -794,9 +805,13 @@ Status KVStore::Delete(const std::string& key) {
         return Status::IOError("db not open");
     }
 
+    if (key.empty()) {
+        return Status::InvalidArgument("key is empty");
+    }
+
     auto it = index_.find(key);
     if (it == index_.end()) {
-        return Status::NotFound("key not found");
+        return Status::OK();
     }
 
     LogRecord record;
@@ -811,6 +826,184 @@ Status KVStore::Delete(const std::string& key) {
     }
 
     index_.erase(key);
+    return Status::OK();
+}
+
+Status KVStore::WriteBatch(const std::vector<WriteBatchOp>& ops) {
+    if (!opened_) {
+        return Status::IOError("db not open");
+    }
+
+    for (const auto& op : ops) {
+        if (op.key.empty()) {
+            return Status::InvalidArgument("batch op key is empty");
+        }
+
+        if (op.type == RecordType::kPut) {
+            LogRecord record;
+            record.type = RecordType::kPut;
+            record.timestamp = static_cast<uint64_t>(std::time(nullptr));
+            record.key = op.key;
+            record.value = op.value;
+
+            IndexEntry entry;
+            Status s = AppendRecord(record, &entry);
+            if (!s.ok()) {
+                return s;
+            }
+            index_.insert_or_assign(record.key, entry);
+            continue;
+        }
+
+        if (op.type == RecordType::kDelete) {
+            auto it = index_.find(op.key);
+            if (it == index_.end()) {
+                continue;
+            }
+
+            LogRecord record;
+            record.type = RecordType::kDelete;
+            record.timestamp = static_cast<uint64_t>(std::time(nullptr));
+            record.key = op.key;
+
+            IndexEntry entry;
+            Status s = AppendRecord(record, &entry);
+            if (!s.ok()) {
+                return s;
+            }
+            index_.erase(op.key);
+            continue;
+        }
+
+        return Status::InvalidArgument("unknown batch op type");
+    }
+
+    return Status::OK();
+}
+
+Status KVStore::NewIterator(std::unique_ptr<Iterator>* iter) {
+    if (!opened_) {
+        return Status::IOError("db not open");
+    }
+    if (iter == nullptr) {
+        return Status::InvalidArgument("iter is null");
+    }
+
+    std::vector<std::pair<std::string, IndexEntry>> entries;
+    entries.reserve(index_.size());
+    for (const auto& [key, entry] : index_) {
+        entries.push_back({key, entry});
+    }
+    std::sort(entries.begin(),
+              entries.end(),
+              [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
+
+    std::vector<std::pair<std::string, std::string>> items;
+    items.reserve(entries.size());
+    for (const auto& [key, entry] : entries) {
+        std::string value;
+        Status s = ReadValueByEntry(entry, &value);
+        if (!s.ok()) {
+            return s;
+        }
+        items.push_back({key, std::move(value)});
+    }
+
+    *iter = std::make_unique<Iterator>(std::move(items));
+    return Status::OK();
+}
+
+Status KVStore::Scan(const std::string& prefix,
+                     std::size_t limit,
+                     std::vector<std::pair<std::string, std::string>>* result) {
+    if (!opened_) {
+        return Status::IOError("db not open");
+    }
+    if (result == nullptr) {
+        return Status::InvalidArgument("result is null");
+    }
+
+    result->clear();
+    std::vector<std::string> keys;
+    keys.reserve(index_.size());
+    for (const auto& [key, _] : index_) {
+        if (key.rfind(prefix, 0) == 0) {
+            keys.push_back(key);
+        }
+    }
+    std::sort(keys.begin(), keys.end());
+
+    for (const auto& key : keys) {
+        auto it = index_.find(key);
+        if (it == index_.end()) {
+            continue;
+        }
+        std::string value;
+        Status s = ReadValueByEntry(it->second, &value);
+        if (!s.ok()) {
+            return s;
+        }
+        result->push_back({key, std::move(value)});
+        if (limit > 0 && result->size() >= limit) {
+            break;
+        }
+    }
+    return Status::OK();
+}
+
+Status KVStore::Fold(const std::function<Status(const std::string&, const std::string&)>& fn) {
+    if (!opened_) {
+        return Status::IOError("db not open");
+    }
+    if (!fn) {
+        return Status::InvalidArgument("fn is empty");
+    }
+
+    std::vector<std::string> keys;
+    keys.reserve(index_.size());
+    for (const auto& [key, _] : index_) {
+        keys.push_back(key);
+    }
+    std::sort(keys.begin(), keys.end());
+
+    for (const auto& key : keys) {
+        auto it = index_.find(key);
+        if (it == index_.end()) {
+            continue;
+        }
+        std::string value;
+        Status s = ReadValueByEntry(it->second, &value);
+        if (!s.ok()) {
+            return s;
+        }
+        s = fn(key, value);
+        if (!s.ok()) {
+            return s;
+        }
+    }
+    return Status::OK();
+}
+
+Status KVStore::ReadValueByEntry(const IndexEntry& entry, std::string* value) {
+    if (value == nullptr) {
+        return Status::InvalidArgument("value output is null");
+    }
+
+    auto file_it = data_files_.find(entry.file_id);
+    if (file_it == data_files_.end()) {
+        return Status::Corruption("index points to missing data file");
+    }
+
+    LogRecord record;
+    uint32_t record_size = 0;
+    Status s = file_it->second->Read(entry.offset, &record, &record_size);
+    if (!s.ok()) {
+        return s;
+    }
+    if (record.type == RecordType::kDelete) {
+        return Status::NotFound("key deleted");
+    }
+    *value = std::move(record.value);
     return Status::OK();
 }
 

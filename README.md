@@ -12,6 +12,9 @@
 - 内存索引：`key -> IndexEntry`
 - 关闭时持久化索引快照：`index.snapshot`
 - 支持 `Put` / `Get` / `Delete`
+- 支持幂等删除（删除不存在 key 返回 OK）
+- 支持 `WriteBatch` 批量写入（put/delete 混合）
+- 支持 `Iterator` / `Scan(prefix)` / `Fold` 遍历能力
 - 删除使用 tombstone 语义
 - 重启后可通过扫描日志恢复索引
 - 若 snapshot 校验通过，优先从 `index.snapshot` 快速恢复

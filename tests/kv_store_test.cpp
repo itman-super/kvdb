@@ -249,7 +249,7 @@ void TestDelete() {
     PassTest(__FUNCTION__);
 }
 
-/// @brief 删除不存在 key 的测试：期望返回 kNotFound 而不是崩溃。
+/// @brief 删除不存在 key 的测试：幂等删除应返回 OK。
 void TestDeleteNonExistentKey() {
     const std::string path = "./testdata/test_delete_non_existent_crc";
     CleanDir(path);
@@ -257,7 +257,76 @@ void TestDeleteNonExistentKey() {
     KVStore db(MakeOptions(path));
     ASSERT_STATUS_OK(db.Open());
 
-    ASSERT_STATUS_CODE(db.Delete("not_exist"), Status::kNotFound);
+    ASSERT_STATUS_OK(db.Delete("not_exist"));
+
+    ASSERT_STATUS_OK(db.Close());
+    PassTest(__FUNCTION__);
+}
+
+/// @brief 批量写入测试：验证 put/delete 混合批处理结果正确。
+void TestWriteBatch() {
+    const std::string path = "./testdata/test_write_batch";
+    CleanDir(path);
+
+    KVStore db(MakeOptions(path));
+    ASSERT_STATUS_OK(db.Open());
+
+    std::vector<KVStore::WriteBatchOp> ops = {
+        {RecordType::kPut, "k1", "v1"},
+        {RecordType::kPut, "k2", "v2"},
+        {RecordType::kPut, "k1", "v3"},
+        {RecordType::kDelete, "k2", ""},
+        {RecordType::kDelete, "not_exist", ""},
+    };
+
+    ASSERT_STATUS_OK(db.WriteBatch(ops));
+
+    std::string value;
+    ASSERT_STATUS_OK(db.Get("k1", &value));
+    ASSERT_EQ(value, std::string("v3"));
+    ASSERT_STATUS_CODE(db.Get("k2", &value), Status::kNotFound);
+
+    ASSERT_STATUS_OK(db.Close());
+    PassTest(__FUNCTION__);
+}
+
+/// @brief Scan/Fold/Iterator 测试：验证有序遍历、前缀扫描和 fold 聚合行为。
+void TestScanFoldAndIterator() {
+    const std::string path = "./testdata/test_scan_fold_iter";
+    CleanDir(path);
+
+    KVStore db(MakeOptions(path));
+    ASSERT_STATUS_OK(db.Open());
+    ASSERT_STATUS_OK(db.Put("a:1", "v1"));
+    ASSERT_STATUS_OK(db.Put("a:2", "v22"));
+    ASSERT_STATUS_OK(db.Put("b:1", "v333"));
+
+    std::vector<std::pair<std::string, std::string>> scan_result;
+    ASSERT_STATUS_OK(db.Scan("a:", 0, &scan_result));
+    ASSERT_EQ(scan_result.size(), static_cast<std::size_t>(2));
+    ASSERT_EQ(scan_result[0].first, std::string("a:1"));
+    ASSERT_EQ(scan_result[1].first, std::string("a:2"));
+
+    int value_total_len = 0;
+    ASSERT_STATUS_OK(db.Fold([&value_total_len](const std::string&, const std::string& value) {
+        value_total_len += static_cast<int>(value.size());
+        return Status::OK();
+    }));
+    ASSERT_EQ(value_total_len, 9);
+
+    std::unique_ptr<KVStore::Iterator> iter;
+    ASSERT_STATUS_OK(db.NewIterator(&iter));
+    ASSERT_TRUE(iter != nullptr);
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->Key(), std::string("a:1"));
+    iter->Next();
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->Key(), std::string("a:2"));
+    iter->Next();
+    ASSERT_TRUE(iter->Valid());
+    ASSERT_EQ(iter->Key(), std::string("b:1"));
+    iter->Next();
+    ASSERT_TRUE(!iter->Valid());
 
     ASSERT_STATUS_OK(db.Close());
     PassTest(__FUNCTION__);
@@ -770,6 +839,8 @@ int main() {
     TestOverwrite();
     TestDelete();
     TestDeleteNonExistentKey();
+    TestWriteBatch();
+    TestScanFoldAndIterator();
     TestRecoveryAfterReopen();
     TestRecoveryWithOverwrite();
     TestRecoveryWithDelete();
