@@ -17,6 +17,8 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
+#include <chrono>
 #include <vector>
 
 #include "data_file.h"
@@ -832,6 +834,30 @@ void TestCloseCreatesIndexSnapshot() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 后台线程自动 Merge 测试：开启后台 merge 后不显式调用 Merge，等待后应自动压缩为单文件。
+void TestBackgroundMerge() {
+    const std::string path = "./testdata/test_background_merge";
+    CleanDir(path);
+
+    Options opt = MakeOptions(path);
+    opt.max_data_file_size = 80;
+    opt.enable_background_merge = true;
+    opt.background_merge_interval_ms = 100;
+    opt.background_merge_min_segments = 2;
+
+    KVStore db(opt);
+    ASSERT_STATUS_OK(db.Open());
+    ASSERT_STATUS_OK(db.Put("k1", "v1"));
+    ASSERT_STATUS_OK(db.Put("k2", "v2"));
+    ASSERT_STATUS_OK(db.Put("k3", "v3"));
+    ASSERT_TRUE(CountDataFiles(path) >= 2);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(350));
+    ASSERT_EQ(CountDataFiles(path), 1);
+    ASSERT_STATUS_OK(db.Close());
+    PassTest(__FUNCTION__);
+}
+
 /// @brief 测试入口：按顺序运行所有测试函数，最终汇总通过/失败数量。
 /// 若有任何失败则以非零退出码退出，便于 CI 检测。
 int main() {
@@ -860,6 +886,7 @@ int main() {
     TestMergeOnEmptyDatabase();
     TestMergeCreatesHintFile();
     TestCloseCreatesIndexSnapshot();
+    TestBackgroundMerge();
 
     std::cout << "\n========== TEST SUMMARY ==========" << std::endl;
     std::cout << "PASSED: " << g_passed << std::endl;

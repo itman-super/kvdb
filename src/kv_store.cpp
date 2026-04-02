@@ -11,6 +11,7 @@
 #include "kv_store.h"
 
 #include <algorithm>
+#include <chrono>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -212,7 +213,77 @@ KVStore::KVStore(Options options) : options_(std::move(options)) {}
 
 /// @brief 析构时自动关闭数据库，确保文件句柄被释放、索引快照被写入。
 KVStore::~KVStore() {
+    StopBackgroundWorker();
     Close();
+}
+
+void KVStore::StartBackgroundWorker() {
+    if (background_worker_.joinable()) {
+        return;
+    }
+
+    if (!options_.enable_background_sync && !options_.enable_background_merge) {
+        return;
+    }
+
+    stop_background_worker_ = false;
+    background_worker_ = std::thread(&KVStore::BackgroundWorkerLoop, this);
+}
+
+void KVStore::StopBackgroundWorker() {
+    {
+        std::lock_guard<std::mutex> lk(background_mutex_);
+        stop_background_worker_ = true;
+    }
+    background_cv_.notify_all();
+    if (background_worker_.joinable()) {
+        background_worker_.join();
+    }
+}
+
+void KVStore::BackgroundWorkerLoop() {
+    using Clock = std::chrono::steady_clock;
+    auto last_sync = Clock::now();
+    auto last_merge = Clock::now();
+
+    while (true) {
+        std::size_t wait_ms = 1000;
+        if (options_.enable_background_sync) {
+            wait_ms = std::min(wait_ms, std::max<std::size_t>(1, options_.background_sync_interval_ms));
+        }
+        if (options_.enable_background_merge) {
+            wait_ms = std::min(wait_ms, std::max<std::size_t>(1, options_.background_merge_interval_ms));
+        }
+
+        std::unique_lock<std::mutex> lk(background_mutex_);
+        background_cv_.wait_for(lk, std::chrono::milliseconds(wait_ms), [this]() {
+            return stop_background_worker_;
+        });
+        if (stop_background_worker_) {
+            return;
+        }
+        lk.unlock();
+
+        const auto now = Clock::now();
+
+        if (options_.enable_background_sync &&
+            now - last_sync >= std::chrono::milliseconds(options_.background_sync_interval_ms)) {
+            std::unique_lock<std::shared_mutex> store_lock(store_mutex_);
+            if (opened_ && active_file_ != nullptr) {
+                (void)active_file_->Sync();
+            }
+            last_sync = now;
+        }
+
+        if (options_.enable_background_merge &&
+            now - last_merge >= std::chrono::milliseconds(options_.background_merge_interval_ms)) {
+            std::unique_lock<std::shared_mutex> store_lock(store_mutex_);
+            if (opened_ && data_files_.size() >= options_.background_merge_min_segments) {
+                (void)MergeUnlocked();
+            }
+            last_merge = now;
+        }
+    }
 }
 
 /// @brief 生成指定 file_id 对应的 segment 文件完整路径。
@@ -248,6 +319,7 @@ std::string KVStore::BuildHintFilePath(uint32_t file_id) const {
 ///
 /// @return 成功返回 Status::OK()，失败返回 IOError 或 Corruption。
 Status KVStore::Open() {
+    std::unique_lock<std::shared_mutex> lock(store_mutex_);
     if (opened_) {
         return Status::OK();
     }
@@ -314,6 +386,7 @@ Status KVStore::Open() {
     }
 
     opened_ = true;
+    StartBackgroundWorker();
     return Status::OK();
 }
 
@@ -328,6 +401,8 @@ Status KVStore::Open() {
 ///
 /// @return 成功返回 Status::OK()，失败返回 IOError。
 Status KVStore::Close() {
+    StopBackgroundWorker();
+    std::unique_lock<std::shared_mutex> lock(store_mutex_);
     if (!opened_ && data_files_.empty()) {
         return Status::OK();
     }
@@ -738,6 +813,7 @@ Status KVStore::AppendRecord(const LogRecord& record, IndexEntry* entry) {
 /// @param value 对应的值（可为空）。
 /// @return 成功返回 Status::OK()，key 为空返回 InvalidArgument，其他失败返回 IOError。
 Status KVStore::Put(const std::string& key, const std::string& value) {
+    std::unique_lock<std::shared_mutex> lock(store_mutex_);
     if (!opened_) {
         return Status::IOError("db not open");
     }
@@ -774,6 +850,7 @@ Status KVStore::Put(const std::string& key, const std::string& value) {
 /// @param value [out] 读取到的值写入此处，不得为 nullptr。
 /// @return 成功返回 Status::OK()；key 不存在返回 NotFound；索引指向缺失文件返回 Corruption。
 Status KVStore::Get(const std::string& key, std::string* value) {
+    std::shared_lock<std::shared_mutex> lock(store_mutex_);
     if (!opened_) {
         return Status::IOError("db not open");
     }
@@ -801,6 +878,7 @@ Status KVStore::Get(const std::string& key, std::string* value) {
 /// @param key 要删除的键。
 /// @return 成功返回 Status::OK()；key 不存在返回 NotFound；写入失败返回 IOError。
 Status KVStore::Delete(const std::string& key) {
+    std::unique_lock<std::shared_mutex> lock(store_mutex_);
     if (!opened_) {
         return Status::IOError("db not open");
     }
@@ -830,6 +908,7 @@ Status KVStore::Delete(const std::string& key) {
 }
 
 Status KVStore::WriteBatch(const std::vector<WriteBatchOp>& ops) {
+    std::unique_lock<std::shared_mutex> lock(store_mutex_);
     if (!opened_) {
         return Status::IOError("db not open");
     }
@@ -882,6 +961,7 @@ Status KVStore::WriteBatch(const std::vector<WriteBatchOp>& ops) {
 }
 
 Status KVStore::NewIterator(std::unique_ptr<Iterator>* iter) {
+    std::shared_lock<std::shared_mutex> lock(store_mutex_);
     if (!opened_) {
         return Status::IOError("db not open");
     }
@@ -916,6 +996,7 @@ Status KVStore::NewIterator(std::unique_ptr<Iterator>* iter) {
 Status KVStore::Scan(const std::string& prefix,
                      std::size_t limit,
                      std::vector<std::pair<std::string, std::string>>* result) {
+    std::shared_lock<std::shared_mutex> lock(store_mutex_);
     if (!opened_) {
         return Status::IOError("db not open");
     }
@@ -952,6 +1033,7 @@ Status KVStore::Scan(const std::string& prefix,
 }
 
 Status KVStore::Fold(const std::function<Status(const std::string&, const std::string&)>& fn) {
+    std::shared_lock<std::shared_mutex> lock(store_mutex_);
     if (!opened_) {
         return Status::IOError("db not open");
     }
@@ -1023,6 +1105,11 @@ Status KVStore::ReadValueByEntry(const IndexEntry& entry, std::string* value) {
 ///
 /// @return 成功返回 Status::OK()，失败返回 IOError 或 Corruption。
 Status KVStore::Merge() {
+    std::unique_lock<std::shared_mutex> lock(store_mutex_);
+    return MergeUnlocked();
+}
+
+Status KVStore::MergeUnlocked() {
     if (!opened_) {
         return Status::IOError("db not open");
     }
