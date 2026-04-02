@@ -217,6 +217,10 @@ KVStore::~KVStore() {
     Close();
 }
 
+/// @brief 启动后台工作线程（若配置了定时 Sync 或定时 Merge）。
+///
+/// 若后台线程已在运行（joinable），或两项后台功能均未开启，则直接返回。
+/// 线程入口为 BackgroundWorkerLoop()，在后台持续等待并定期执行 Sync/Merge。
 void KVStore::StartBackgroundWorker() {
     if (background_worker_.joinable()) {
         return;
@@ -230,6 +234,11 @@ void KVStore::StartBackgroundWorker() {
     background_worker_ = std::thread(&KVStore::BackgroundWorkerLoop, this);
 }
 
+/// @brief 通知后台工作线程停止，并阻塞等待其退出。
+///
+/// 通过向 background_cv_ 发送通知、设置 stop_background_worker_ = true
+/// 来唤醒并终止 BackgroundWorkerLoop()，然后 join 线程。
+/// 若线程未运行（not joinable），此调用为空操作。
 void KVStore::StopBackgroundWorker() {
     {
         std::lock_guard<std::mutex> lk(background_mutex_);
@@ -241,6 +250,18 @@ void KVStore::StopBackgroundWorker() {
     }
 }
 
+/// @brief 后台工作线程主循环。
+///
+/// 循环逻辑：
+///  1. 计算下次唤醒等待时间（取 sync_interval 和 merge_interval 的较小值）。
+///  2. 通过 condition_variable::wait_for 阻塞等待，直到超时或收到停止信号。
+///  3. 收到停止信号则退出循环。
+///  4. 若启用了定时 Sync，且距上次 Sync 已超过 background_sync_interval_ms，
+///     则对当前活跃文件执行一次 Sync。
+///  5. 若启用了定时 Merge，且距上次 Merge 已超过 background_merge_interval_ms，
+///     且当前 segment 数量 >= background_merge_min_segments，则执行一次 MergeUnlocked。
+///
+/// 执行 Sync/Merge 时持有 store_mutex_ 独占锁，确保线程安全。
 void KVStore::BackgroundWorkerLoop() {
     using Clock = std::chrono::steady_clock;
     auto last_sync = Clock::now();
@@ -907,6 +928,20 @@ Status KVStore::Delete(const std::string& key) {
     return Status::OK();
 }
 
+/// @brief 以原子方式顺序执行一组 Put/Delete 混合写入操作。
+///
+/// 批处理流程：
+///  1. 验证数据库已打开。
+///  2. 遍历操作列表，对每条操作：
+///     - 若 key 为空，返回 InvalidArgument。
+///     - kPut 操作：追加 Put 记录并更新内存索引。
+///     - kDelete 操作：若 key 存在则追加 tombstone 并从索引移除；不存在则跳过。
+///     - 未知操作类型：返回 InvalidArgument。
+///  3. 任一操作失败则立即返回，已执行的操作**不会**回滚（非事务型批写）。
+///
+/// @param ops 要执行的操作列表，每项包含 type / key / value。
+/// @return 成功返回 Status::OK()；key 为空或类型非法返回 InvalidArgument；
+///         I/O 失败返回 IOError。
 Status KVStore::WriteBatch(const std::vector<WriteBatchOp>& ops) {
     std::unique_lock<std::shared_mutex> lock(store_mutex_);
     if (!opened_) {
@@ -960,6 +995,18 @@ Status KVStore::WriteBatch(const std::vector<WriteBatchOp>& ops) {
     return Status::OK();
 }
 
+/// @brief 创建一个按 key 升序排列的快照迭代器。
+///
+/// 实现步骤：
+///  1. 在持有读锁时，将当前内存索引中的所有条目按 key 升序排序。
+///  2. 逐 key 从磁盘读取对应 value（ReadValueByEntry）。
+///  3. 将所有 (key, value) 对封装为 Iterator 返回。
+///
+/// 注意：迭代器是基于创建时刻的索引快照，不反映创建后的写入变化。
+/// 创建迭代器的开销与当前 key 数量成正比（需要全量读磁盘）。
+///
+/// @param iter [out] 创建的迭代器对象写入此处，不得为 nullptr。
+/// @return 成功返回 Status::OK()；iter 为 nullptr 返回 InvalidArgument；读取失败返回相应错误。
 Status KVStore::NewIterator(std::unique_ptr<Iterator>* iter) {
     std::shared_lock<std::shared_mutex> lock(store_mutex_);
     if (!opened_) {
@@ -993,6 +1040,20 @@ Status KVStore::NewIterator(std::unique_ptr<Iterator>* iter) {
     return Status::OK();
 }
 
+/// @brief 按前缀扫描 key，返回所有匹配的键值对（按 key 升序）。
+///
+/// 扫描流程：
+///  1. 从内存索引中筛选出所有以 prefix 为前缀的 key（空前缀匹配所有 key）。
+///  2. 对筛出的 key 升序排序。
+///  3. 逐个从磁盘读取对应 value，追加到 result。
+///  4. 若 limit > 0 且已收集 limit 条记录，提前停止。
+///
+/// @param prefix  key 前缀过滤字符串，空串表示返回所有 key。
+/// @param limit   最多返回的条目数，0 表示不限制。
+/// @param result  [out] 匹配的键值对列表，调用前无需清空（函数内部会 clear）。
+///                不得为 nullptr。
+/// @return 成功返回 Status::OK()；result 为 nullptr 返回 InvalidArgument；
+///         读取失败返回对应错误。
 Status KVStore::Scan(const std::string& prefix,
                      std::size_t limit,
                      std::vector<std::pair<std::string, std::string>>* result) {
@@ -1032,6 +1093,16 @@ Status KVStore::Scan(const std::string& prefix,
     return Status::OK();
 }
 
+/// @brief 按 key 升序遍历所有键值对，对每对调用用户提供的回调函数。
+///
+/// 遍历流程：
+///  1. 将内存索引中所有 key 收集后升序排序。
+///  2. 逐个读取 value，调用 fn(key, value)。
+///  3. 若 fn 返回非 OK 状态，立即停止遍历并将该状态向上传递。
+///
+/// @param fn 每对 (key, value) 的处理回调。若返回非 OK，遍历中止。不得为空（null）。
+/// @return 成功遍历全部返回 Status::OK()；fn 为空返回 InvalidArgument；
+///         fn 返回非 OK 时透传该状态；读取失败返回对应 I/O 错误。
 Status KVStore::Fold(const std::function<Status(const std::string&, const std::string&)>& fn) {
     std::shared_lock<std::shared_mutex> lock(store_mutex_);
     if (!opened_) {
@@ -1066,6 +1137,20 @@ Status KVStore::Fold(const std::function<Status(const std::string&, const std::s
     return Status::OK();
 }
 
+/// @brief 根据内存索引项（IndexEntry）从对应 segment 文件读取 value。
+///
+/// 步骤：
+///  1. 在 data_files_ 中按 entry.file_id 查找对应 DataFile。
+///  2. 调用 DataFile::Read(entry.offset, ...) 读取完整记录并验证 CRC。
+///  3. 若读取到 kDelete 记录（理论上活跃索引不应指向 tombstone），
+///     作为防御返回 NotFound。
+///
+/// 此函数为内部辅助方法，调用方（Get/NewIterator/Scan/Fold）负责持有适当的锁。
+///
+/// @param entry  内存索引条目，包含 file_id、offset 等位置信息。
+/// @param value  [out] 读取到的 value，不得为 nullptr。
+/// @return 成功返回 Status::OK()；文件缺失返回 Corruption；
+///         记录被标记为删除返回 NotFound；读取失败返回对应错误。
 Status KVStore::ReadValueByEntry(const IndexEntry& entry, std::string* value) {
     if (value == nullptr) {
         return Status::InvalidArgument("value output is null");
@@ -1109,6 +1194,12 @@ Status KVStore::Merge() {
     return MergeUnlocked();
 }
 
+/// @brief 在已持有 store_mutex_ 独占锁的情况下执行 Merge/Compaction。
+///
+/// 该方法是 Merge() 的实际实现，提取为独立函数以便后台任务线程复用（无需二次加锁）。
+/// 详细步骤与 Merge() 的文档相同，参见 KVStore::Merge 的注释。
+///
+/// @return 成功返回 Status::OK()，失败返回 IOError 或 Corruption。
 Status KVStore::MergeUnlocked() {
     if (!opened_) {
         return Status::IOError("db not open");
