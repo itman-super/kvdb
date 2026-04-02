@@ -2,3 +2,5 @@ build/
 .idea/
 *.o
 *.d
+testdata/
+data/
