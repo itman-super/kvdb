@@ -24,18 +24,25 @@
 // - 读取会按 index 中的 file_id 定位到对应文件
 class KVStore {
 public:
+    /// @brief 批处理操作描述：支持 put/delete 混合。
     struct WriteBatchOp {
         RecordType type = RecordType::kPut;
         std::string key;
         std::string value;
     };
 
+    /// @brief 基于快照的只读迭代器（按 key 升序）。
     class Iterator {
     public:
+        /// @brief 构造快照迭代器。
         explicit Iterator(std::vector<std::pair<std::string, std::string>> items);
+        /// @brief 当前是否仍指向有效元素。
         bool Valid() const;
+        /// @brief 前进到下一项。
         void Next();
+        /// @brief 获取当前 key；若无效会抛出 out_of_range。
         const std::string& Key() const;
+        /// @brief 获取当前 value；若无效会抛出 out_of_range。
         const std::string& Value() const;
 
     private:
@@ -43,46 +50,42 @@ public:
         std::size_t index_ = 0;
     };
 
-    // 构造数据库对象。
+    /// @brief 构造数据库对象（不自动打开）。
     explicit KVStore(Options options);
 
-    // 析构时自动 Close，释放文件资源。
+    /// @brief 析构时自动关闭并清理后台线程。
     ~KVStore();
 
-    // 打开数据库并完成恢复。
-    // 步骤：创建目录 -> 打开/创建 segment -> 扫描日志恢复索引。
+    /// @brief 打开数据库并执行恢复流程。
     Status Open();
 
-    // 关闭数据库并释放句柄。
+    /// @brief 关闭数据库并刷新必要元数据。
     Status Close();
 
-    // 写入/覆盖 key。
+    /// @brief 写入或覆盖一个 key。
     Status Put(const std::string& key, const std::string& value);
 
-    // 读取 key 对应 value。
+    /// @brief 读取 key 对应的 value。
     Status Get(const std::string& key, std::string* value);
 
-    // 删除 key（写入 tombstone）。
+    /// @brief 删除 key（通过写入 tombstone 实现）。
     Status Delete(const std::string& key);
 
-    // 批量写入：支持 put/delete 混合顺序执行。
+    /// @brief 顺序执行批量写入操作。
     Status WriteBatch(const std::vector<WriteBatchOp>& ops);
 
-    // 构造一个按 key 升序遍历的快照迭代器。
+    /// @brief 创建按 key 升序的快照迭代器。
     Status NewIterator(std::unique_ptr<Iterator>* iter);
 
-    // 按 key 升序扫描 prefix 前缀，最多返回 limit 条（0 表示不限）。
+    /// @brief 按前缀扫描 key（升序），limit=0 表示不限制返回条数。
     Status Scan(const std::string& prefix,
                 std::size_t limit,
                 std::vector<std::pair<std::string, std::string>>* result);
 
-    // 对全部 key-value 做一次 fold（按 key 升序）。
+    /// @brief 按 key 升序遍历全部键值并执行回调。
     Status Fold(const std::function<Status(const std::string&, const std::string&)>& fn);
 
-    // 手动触发 Merge/Compaction：
-    // - 仅保留当前“存活”的 key 最新值
-    // - 清理历史旧版本和 tombstone
-    // - 产出新的单一 active segment
+    /// @brief 手动触发 Merge/Compaction，仅保留存活 key 的最新值。
     Status Merge();
 
 private:

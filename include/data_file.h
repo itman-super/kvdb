@@ -7,39 +7,52 @@
 #include "log_record.h"
 #include "status.h"
 
-// DataFile 负责单个日志文件的读写。
-// 第一版只维护一个 active data file，因此它承担：
-// 1. 追加写日志记录
-// 2. 按 offset 读取日志记录
-// 3. 文件 flush/sync
+/// @brief DataFile 封装单个 segment 文件(data_<id>.log)的底层读写与持久化操作。
+///
+/// 该类负责：
+/// - 追加写入逻辑记录（append-only）。
+/// - 按偏移随机读取单条记录并做格式/CRC 校验。
+/// - 提供 Sync/Truncate 等崩溃恢复相关能力。
 class DataFile {
 public:
+    /// @brief 构造 DataFile 对象（仅保存元数据，不打开文件）。
     DataFile(uint32_t file_id, std::string file_path);
+
+    /// @brief 析构函数，会尝试安全关闭底层文件句柄。
     ~DataFile();
 
-    // 打开文件
-    // writable=true 代表需要同时支持写入
+    /// @brief 打开文件。
+    /// @param writable 为 true 时以读写模式打开/创建；否则以只读模式打开。
     Status Open(bool writable);
 
-    // 关闭文件
+    /// @brief 关闭文件并释放底层句柄。
     Status Close();
 
-    // 追加一条逻辑记录到文件末尾
-    // offset: 返回本条记录起始偏移
-    // written_size: 返回写入字节数
+    /// @brief 追加一条逻辑记录到文件末尾。
+    /// @param record 逻辑记录。
+    /// @param offset [out] 返回记录起始偏移。
+    /// @param written_size [out] 返回写入总字节数。
     Status Append(const LogRecord& record, uint64_t* offset, uint32_t* written_size);
 
-    // 从指定偏移读取一条完整记录
+    /// @brief 从指定偏移读取一条完整记录。
+    /// @param offset 记录起始偏移。
+    /// @param record [out] 解码后的逻辑记录。
+    /// @param record_size [out] 记录总字节数。
     Status Read(uint64_t offset, LogRecord* record, uint32_t* record_size);
 
-    // 刷盘
-    // 先 flush 用户态缓冲，再执行真正的 fsync/fdatasync（平台相关）。
+    /// @brief 将文件数据刷盘（flush + fsync/fdatasync）。
     Status Sync();
 
-    // 获取文件大小
+    /// @brief 获取当前文件大小。
     uint64_t Size();
-    Status Truncate(uint64_t size);   // 新增：坏尾恢复时裁剪文件
+
+    /// @brief 将文件截断到指定大小，常用于崩溃恢复时修剪坏尾。
+    Status Truncate(uint64_t size);
+
+    /// @brief 获取当前文件 ID。
     uint32_t FileId() const { return file_id_; }
+
+    /// @brief 获取文件路径。
     const std::string& Path() const { return file_path_; }
 
 private:
