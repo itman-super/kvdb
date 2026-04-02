@@ -20,6 +20,7 @@
 #include <thread>
 #include <chrono>
 #include <vector>
+#include <unordered_map>
 
 #include "data_file.h"
 #include "kv_store.h"
@@ -858,6 +859,152 @@ void TestBackgroundMerge() {
     PassTest(__FUNCTION__);
 }
 
+
+
+/// @brief 边界测试：空 value 应允许写入并可原样读回。
+void TestEmptyValueRoundTrip() {
+    const std::string path = "./testdata/test_empty_value_round_trip";
+    CleanDir(path);
+
+    KVStore db(MakeOptions(path));
+    ASSERT_STATUS_OK(db.Open());
+    ASSERT_STATUS_OK(db.Put("empty-value", ""));
+
+    std::string value;
+    ASSERT_STATUS_OK(db.Get("empty-value", &value));
+    ASSERT_EQ(value, std::string(""));
+
+    ASSERT_STATUS_OK(db.Close());
+    PassTest(__FUNCTION__);
+}
+
+/// @brief 边界测试：Scan 的 limit=1 与 limit=0（不限）行为应正确。
+void TestScanLimitBoundaries() {
+    const std::string path = "./testdata/test_scan_limit_boundaries";
+    CleanDir(path);
+
+    KVStore db(MakeOptions(path));
+    ASSERT_STATUS_OK(db.Open());
+    ASSERT_STATUS_OK(db.Put("k1", "v1"));
+    ASSERT_STATUS_OK(db.Put("k2", "v2"));
+    ASSERT_STATUS_OK(db.Put("k3", "v3"));
+
+    std::vector<std::pair<std::string, std::string>> result;
+    ASSERT_STATUS_OK(db.Scan("k", 1, &result));
+    ASSERT_EQ(result.size(), static_cast<std::size_t>(1));
+    ASSERT_EQ(result[0].first, std::string("k1"));
+
+    result.clear();
+    ASSERT_STATUS_OK(db.Scan("k", 0, &result));
+    ASSERT_EQ(result.size(), static_cast<std::size_t>(3));
+
+    ASSERT_STATUS_OK(db.Close());
+    PassTest(__FUNCTION__);
+}
+
+/// @brief 边界测试：WriteBatch 中出现空 key 时应返回 kInvalidArgument。
+void TestWriteBatchRejectsEmptyKey() {
+    const std::string path = "./testdata/test_write_batch_rejects_empty_key";
+    CleanDir(path);
+
+    KVStore db(MakeOptions(path));
+    ASSERT_STATUS_OK(db.Open());
+
+    std::vector<KVStore::WriteBatchOp> ops = {
+        {RecordType::kPut, "k1", "v1"},
+        {RecordType::kPut, "", "bad"},
+    };
+
+    ASSERT_STATUS_CODE(db.WriteBatch(ops), Status::kInvalidArgument);
+
+    // 当前实现为顺序执行，遇到非法 op 前已提交的数据会保留。
+    std::string value;
+    ASSERT_STATUS_OK(db.Get("k1", &value));
+    ASSERT_EQ(value, std::string("v1"));
+
+    ASSERT_STATUS_OK(db.Close());
+    PassTest(__FUNCTION__);
+}
+
+/// @brief 崩溃恢复测试：snapshot 损坏时应回退到扫描日志恢复，而不是启动失败。
+void TestRecoveryFallsBackWhenSnapshotCorrupted() {
+    const std::string path = "./testdata/test_recovery_snapshot_corrupted";
+    CleanDir(path);
+
+    {
+        KVStore db(MakeOptions(path));
+        ASSERT_STATUS_OK(db.Open());
+        ASSERT_STATUS_OK(db.Put("name", "kvdb"));
+        ASSERT_STATUS_OK(db.Put("lang", "cpp"));
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    ASSERT_TRUE(FlipOneByte(SnapshotPath(path), 0));
+
+    {
+        KVStore db(MakeOptions(path));
+        ASSERT_STATUS_OK(db.Open());
+
+        std::string value;
+        ASSERT_STATUS_OK(db.Get("name", &value));
+        ASSERT_EQ(value, std::string("kvdb"));
+        ASSERT_STATUS_OK(db.Get("lang", &value));
+        ASSERT_EQ(value, std::string("cpp"));
+
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    PassTest(__FUNCTION__);
+}
+
+/// @brief 压力测试：大量随机 put/delete 后重启，验证数据一致性。
+void TestStressRandomPutDeleteAndRecovery() {
+    const std::string path = "./testdata/test_stress_random_put_delete";
+    CleanDir(path);
+
+    Options opt = MakeOptions(path);
+    opt.max_data_file_size = 4 << 10;  // 提高 rotate 覆盖率。
+
+    std::unordered_map<std::string, std::string> expected;
+    {
+        KVStore db(opt);
+        ASSERT_STATUS_OK(db.Open());
+
+        for (int i = 0; i < 5000; ++i) {
+            const std::string key = "k" + std::to_string(i % 300);
+            if (i % 7 == 0) {
+                ASSERT_STATUS_OK(db.Delete(key));
+                expected.erase(key);
+            } else {
+                const std::string value = "v" + std::to_string(i) + std::string(i % 17, 'x');
+                ASSERT_STATUS_OK(db.Put(key, value));
+                expected[key] = value;
+            }
+        }
+
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    {
+        KVStore db(opt);
+        ASSERT_STATUS_OK(db.Open());
+        std::string value;
+        for (int i = 0; i < 300; ++i) {
+            const std::string key = "k" + std::to_string(i);
+            auto it = expected.find(key);
+            if (it == expected.end()) {
+                ASSERT_STATUS_CODE(db.Get(key, &value), Status::kNotFound);
+            } else {
+                ASSERT_STATUS_OK(db.Get(key, &value));
+                ASSERT_EQ(value, it->second);
+            }
+        }
+        ASSERT_STATUS_OK(db.Close());
+    }
+
+    PassTest(__FUNCTION__);
+}
+
 /// @brief 测试入口：按顺序运行所有测试函数，最终汇总通过/失败数量。
 /// 若有任何失败则以非零退出码退出，便于 CI 检测。
 int main() {
@@ -872,8 +1019,12 @@ int main() {
     TestRecoveryWithDelete();
     TestEmptyKey();
     TestGetNonExistentKey();
+    TestEmptyValueRoundTrip();
+    TestScanLimitBoundaries();
+    TestWriteBatchRejectsEmptyKey();
 
     TestRecoveryWithLargeValue();
+    TestRecoveryFallsBackWhenSnapshotCorrupted();
     TestCRCDetectsCorruptionOnOpen();
     TestRecoveryStopsAtPartialTailRecord();
     TestMultiSegmentRotationAndRecovery();
@@ -887,6 +1038,7 @@ int main() {
     TestMergeCreatesHintFile();
     TestCloseCreatesIndexSnapshot();
     TestBackgroundMerge();
+    TestStressRandomPutDeleteAndRecovery();
 
     std::cout << "\n========== TEST SUMMARY ==========" << std::endl;
     std::cout << "PASSED: " << g_passed << std::endl;
