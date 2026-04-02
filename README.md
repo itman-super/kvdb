@@ -11,6 +11,8 @@
 - Merge 后生成 hint file：`hint_<id>.hint`
 - 内存索引：`key -> IndexEntry`
 - 关闭时持久化索引快照：`index.snapshot`
+- 读写锁并发控制（读共享锁 / 写独占锁）
+- 可选后台线程：定期 `sync` / 自动 `merge`
 - 支持 `Put` / `Get` / `Delete`
 - 支持幂等删除（删除不存在 key 返回 OK）
 - 支持 `WriteBatch` 批量写入（put/delete 混合）
@@ -178,6 +180,16 @@ key bytes + value bytes
   每次写入后是否立即 `flush`
 - `max_data_file_size`
   单个 segment 的最大大小，超过后会自动 rotation
+- `enable_background_sync`
+  是否启用后台定时 `Sync`
+- `background_sync_interval_ms`
+  后台 `Sync` 间隔（毫秒）
+- `enable_background_merge`
+  是否启用后台定时 `Merge`
+- `background_merge_interval_ms`
+  后台 `Merge` 间隔（毫秒）
+- `background_merge_min_segments`
+  触发后台 `Merge` 的最小 segment 数
 
 说明：`sync_on_write` 当前调用的是 `file_.flush()`，并不是严格意义上的 `fsync` / `fdatasync`。
 

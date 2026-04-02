@@ -1,8 +1,12 @@
 #pragma once
 
 #include <functional>
+#include <condition_variable>
+#include <mutex>
 #include <memory>
+#include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -82,6 +86,18 @@ public:
     Status Merge();
 
 private:
+    // 启动后台任务线程（定期 sync/merge）。
+    void StartBackgroundWorker();
+
+    // 停止后台任务线程。
+    void StopBackgroundWorker();
+
+    // 后台任务主循环。
+    void BackgroundWorkerLoop();
+
+    // 在持有 store_mutex_ 独占锁时执行一次 merge。
+    Status MergeUnlocked();
+
     // 启动恢复：按 file_id 升序扫描所有 segment，重建 index_。
     Status Recover();
 
@@ -139,4 +155,13 @@ private:
 
     // 数据库是否已打开。
     bool opened_ = false;
+
+    // 读写锁：读路径共享锁，写路径独占锁。
+    mutable std::shared_mutex store_mutex_;
+
+    // 后台线程控制。
+    std::thread background_worker_;
+    std::mutex background_mutex_;
+    std::condition_variable background_cv_;
+    bool stop_background_worker_ = false;
 };
