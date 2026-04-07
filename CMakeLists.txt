@@ -63,3 +63,21 @@ if(MSVC)
 else()
     target_compile_options(kvdb_bench PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+
+add_executable(kvdb_perf
+        tests/kv_store_perf_platform.cpp
+        src/kv_store.cpp
+        src/data_file.cpp
+)
+
+target_include_directories(kvdb_perf
+        PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+if(MSVC)
+    target_compile_options(kvdb_perf PRIVATE /W4)
+else()
+    target_compile_options(kvdb_perf PRIVATE -Wall -Wextra -Wpedantic)
+endif()

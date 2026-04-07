@@ -133,7 +133,8 @@ kvdb/
 │   └── main.cpp            — 最小演示程序
 └── tests/
     ├── kv_store_test.cpp   — 功能、边界、崩溃恢复、完整性测试
-    └── kv_store_benchmark.cpp — Put/Get 吞吐量基准测试
+    ├── kv_store_benchmark.cpp — Put/Get 吞吐量基准测试
+    └── kv_store_perf_platform.cpp — 可配置性能测试平台（支持 CSV 结果）
 ```
 
 ---
@@ -430,7 +431,8 @@ cmake --build build
 |------|------|
 | `build/bin/kvdb` | 最小演示程序 |
 | `build/bin/kvdb_test` | 功能 + 崩溃恢复 + 完整性测试 |
-| `build/bin/kvdb_bench` | 吞吐量基准测试 |
+| `build/bin/kvdb_bench` | 吞吐量基准测试（固定规模） |
+| `build/bin/kvdb_perf` | 可配置性能测试平台（建议用于回归） |
 
 ---
 
@@ -479,16 +481,47 @@ cmake --build build
 
 ## 基准测试 / Benchmark
 
+### 1) 快速基准（固定规模）
+
 ```bash
 ./build/bin/kvdb_bench
 ```
 
-默认执行固定规模 Put/Get（10 万次）并输出：
+默认执行固定规模 Put/Get（10 万次）并输出 Put/Get 总耗时与估算 QPS。
 
-- Put 总耗时和估算 QPS
-- Get 总耗时和估算 QPS
+### 2) 性能测试平台（推荐）
 
-> 该 benchmark 主要用于回归对比，不代表生产场景性能。
+```bash
+./build/bin/kvdb_perf --profile mixed --ops 200000 --threads 1 \
+  --out ./testdata/perf/results.csv
+```
+
+`kvdb_perf` 支持：
+
+- **场景模板**：`mixed` / `write-heavy` / `read-heavy`
+- **参数化压测**：操作数、线程数、value 大小、预填充 key 数、sync 策略
+- **结果落盘**：追加写入 CSV，方便新功能合入前后做对比
+- **延迟分位数**：输出 p50 / p95 / p99（微秒）
+
+常用示例：
+
+```bash
+# 写密集（适合评估写路径改动）
+./build/bin/kvdb_perf --profile write-heavy --ops 300000 --threads 1
+
+# 读密集 + 更大 value（适合评估索引/读取优化）
+./build/bin/kvdb_perf --profile read-heavy --value-size 512 --threads 1
+
+# 保留历史数据目录，不清理，观察长期运行趋势
+./build/bin/kvdb_perf --profile mixed --no-clean --out ./testdata/perf/results.csv
+```
+
+也可以使用脚本一次性执行回归场景：
+
+```bash
+# 一键执行回归基线场景（写密集/混合/读密集）
+./scripts/run_perf_regression.sh
+```
 
 ---
 
