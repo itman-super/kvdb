@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>  // numeric_limits
+#include <mutex>
 #include <vector>
 
 #ifdef _WIN32
@@ -190,6 +191,7 @@ DataFile::~DataFile() {
 /// @param writable true 表示需要读写，false 表示只读。
 /// @return 成功返回 Status::OK()，失败返回 IOError。
 Status DataFile::Open(bool writable) {
+    std::unique_lock<std::shared_mutex> lock(file_mutex_);
     writable_ = writable;
 
     if (file_.is_open()) {
@@ -240,6 +242,7 @@ Status DataFile::Open(bool writable) {
 ///
 /// @return 成功返回 Status::OK()，失败返回 IOError。
 Status DataFile::Close() {
+    std::unique_lock<std::shared_mutex> lock(file_mutex_);
 #ifdef _WIN32
     if (sync_fd_ >= 0) {
         _close(sync_fd_);
@@ -272,6 +275,7 @@ Status DataFile::Close() {
 ///
 /// @return 成功返回 Status::OK()，失败返回 IOError。
 Status DataFile::Sync() {
+    std::unique_lock<std::shared_mutex> lock(file_mutex_);
     if (!file_.is_open()) {
         return Status::IOError("file not open");
     }
@@ -325,6 +329,7 @@ Status DataFile::Sync() {
 ///
 /// @return 文件字节数，失败返回 0。
 uint64_t DataFile::Size() {
+    std::unique_lock<std::shared_mutex> lock(file_mutex_);
     if (!file_.is_open()) {
         return 0;
     }
@@ -374,12 +379,22 @@ Status DataFile::WriteBytes(const char* data, std::size_t len) {
 /// @param len    需要读取的字节数。
 /// @return 成功返回 Status::OK()，offset 越界返回 OutOfRange，其他失败返回 IOError。
 Status DataFile::ReadBytes(uint64_t offset, char* data, std::size_t len) {
+    std::unique_lock<std::shared_mutex> lock(file_mutex_);
     if (!file_.is_open()) {
         return Status::IOError("file not open");
     }
 
-    // 在真正读取前做边界校验，避免 seek/read 后才发现 EOF。
-    const uint64_t file_size = Size();
+    file_.clear();
+    file_.seekg(0, std::ios::end);
+    if (!file_) {
+        return Status::IOError("seekg end failed");
+    }
+    std::streamoff end_pos = file_.tellg();
+    if (end_pos < 0) {
+        return Status::IOError("tellg failed");
+    }
+    const uint64_t file_size = static_cast<uint64_t>(end_pos);
+
     if (offset > file_size) {
         return Status::OutOfRange("offset out of range: " + std::to_string(offset) +
                                   ", file_size: " + std::to_string(file_size));
@@ -391,7 +406,6 @@ Status DataFile::ReadBytes(uint64_t offset, char* data, std::size_t len) {
     }
 
     file_.clear();
-    // seekg 失败通常意味着偏移非法或底层流状态异常。
     file_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
     if (!file_) {
         return Status::IOError("seekg failed at offset: " + std::to_string(offset));
@@ -535,6 +549,7 @@ Status DataFile::DecodeRecord(const std::string& buf, LogRecord* record) {
 /// @param written_size [out] 实际写入的字节数，可为 nullptr。
 /// @return 成功返回 Status::OK()，失败返回 IOError。
 Status DataFile::Append(const LogRecord& record, uint64_t* offset, uint32_t* written_size) {
+    std::unique_lock<std::shared_mutex> lock(file_mutex_);
     if (!file_.is_open()) {
         return Status::IOError("file not open");
     }
@@ -656,6 +671,7 @@ Status DataFile::Read(uint64_t offset, LogRecord* record, uint32_t* record_size)
 /// @param size 截断后的目标文件大小（字节）。
 /// @return 成功返回 Status::OK()，失败返回 IOError。
 Status DataFile::Truncate(uint64_t size) {
+    std::unique_lock<std::shared_mutex> lock(file_mutex_);
     if (!file_.is_open()) {
         return Status::IOError("file not open");
     }
@@ -670,10 +686,25 @@ Status DataFile::Truncate(uint64_t size) {
         return Status::IOError("truncate failed: " + ec.message());
     }
 
-    // 重新打开，保持对象可继续使用
-    Status s = Open(writable_);
-    if (!s.ok()) {
-        return s;
+    std::ios::openmode mode = std::ios::binary | std::ios::in;
+    if (writable_) {
+        mode |= std::ios::out;
+    }
+    file_.open(file_path_, mode);
+    if (!file_.is_open()) {
+        return Status::IOError("failed to reopen file after truncate");
+    }
+
+    if (writable_) {
+#ifdef _WIN32
+        sync_fd_ = _open(file_path_.c_str(), _O_BINARY | _O_RDWR);
+#else
+        sync_fd_ = ::open(file_path_.c_str(), O_RDWR);
+#endif
+        if (sync_fd_ < 0) {
+            file_.close();
+            return Status::IOError("failed to reopen sync fd after truncate");
+        }
     }
 
     return Status::OK();

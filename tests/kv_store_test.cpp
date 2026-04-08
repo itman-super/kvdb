@@ -21,6 +21,7 @@
 #include <chrono>
 #include <vector>
 #include <unordered_map>
+#include <atomic>
 
 #include "data_file.h"
 #include "kv_store.h"
@@ -1005,6 +1006,68 @@ void TestStressRandomPutDeleteAndRecovery() {
     PassTest(__FUNCTION__);
 }
 
+/// @brief 并发读写测试：多线程并发写入与读取，验证最终数据完整性与线程安全。
+void TestConcurrentReadWrite() {
+    const std::string path = "./testdata/test_concurrent_read_write";
+    CleanDir(path);
+
+    Options opt = MakeOptions(path);
+    opt.max_data_file_size = 8 << 10;
+
+    KVStore db(opt);
+    ASSERT_STATUS_OK(db.Open());
+
+    constexpr int kWriterThreads = 6;
+    constexpr int kKeysPerWriter = 300;
+    std::atomic<int> write_failures{0};
+
+    std::vector<std::thread> writers;
+    writers.reserve(kWriterThreads);
+    for (int t = 0; t < kWriterThreads; ++t) {
+        writers.emplace_back([&db, &write_failures, t]() {
+            for (int i = 0; i < kKeysPerWriter; ++i) {
+                const std::string key = "w" + std::to_string(t) + "_k" + std::to_string(i);
+                const std::string value = "v" + std::to_string(t) + "_" + std::to_string(i);
+                if (!db.Put(key, value).ok()) {
+                    ++write_failures;
+                }
+            }
+        });
+    }
+    for (auto& th : writers) {
+        th.join();
+    }
+
+    ASSERT_EQ(write_failures.load(), 0);
+
+    constexpr int kReaderThreads = 8;
+    std::atomic<int> read_failures{0};
+    std::vector<std::thread> readers;
+    readers.reserve(kReaderThreads);
+    for (int r = 0; r < kReaderThreads; ++r) {
+        readers.emplace_back([&db, &read_failures]() {
+            for (int t = 0; t < kWriterThreads; ++t) {
+                for (int i = 0; i < kKeysPerWriter; ++i) {
+                    const std::string key = "w" + std::to_string(t) + "_k" + std::to_string(i);
+                    const std::string expected = "v" + std::to_string(t) + "_" + std::to_string(i);
+                    std::string value;
+                    Status s = db.Get(key, &value);
+                    if (!s.ok() || value != expected) {
+                        ++read_failures;
+                    }
+                }
+            }
+        });
+    }
+    for (auto& th : readers) {
+        th.join();
+    }
+
+    ASSERT_EQ(read_failures.load(), 0);
+    ASSERT_STATUS_OK(db.Close());
+    PassTest(__FUNCTION__);
+}
+
 /// @brief 测试入口：按顺序运行所有测试函数，最终汇总通过/失败数量。
 /// 若有任何失败则以非零退出码退出，便于 CI 检测。
 int main() {
@@ -1039,6 +1102,7 @@ int main() {
     TestCloseCreatesIndexSnapshot();
     TestBackgroundMerge();
     TestStressRandomPutDeleteAndRecovery();
+    TestConcurrentReadWrite();
 
     std::cout << "\n========== TEST SUMMARY ==========" << std::endl;
     std::cout << "PASSED: " << g_passed << std::endl;
