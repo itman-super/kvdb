@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <shared_mutex>
 #include <string>
 
 #include "log_record.h"
@@ -75,4 +76,5 @@ private:
     bool writable_ = false;
     bool need_dir_sync_ = false;
     int sync_fd_ = -1;
+    mutable std::shared_mutex file_mutex_;
 };
