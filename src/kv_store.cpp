@@ -250,6 +250,116 @@ void KVStore::StopBackgroundWorker() {
     }
 }
 
+Status KVStore::EnqueueWriteRequest(std::vector<WriteBatchOp> ops) {
+    if (!opened_.load()) {
+        return Status::IOError("db not open");
+    }
+
+    WriteRequest req;
+    req.ops = std::move(ops);
+    std::future<Status> done = req.done.get_future();
+    req.sequence = enqueued_sequence_.fetch_add(1) + 1;
+    {
+        std::lock_guard<std::mutex> lk(write_queue_mutex_);
+        write_queue_.push_back(std::move(req));
+    }
+    write_queue_cv_.notify_one();
+    return done.get();
+}
+
+void KVStore::WaitForAppliedSequence(uint64_t sequence) {
+    std::unique_lock<std::mutex> lk(applied_sequence_mutex_);
+    applied_sequence_cv_.wait(lk, [this, sequence]() {
+        return applied_sequence_.load() >= sequence || !opened_.load();
+    });
+}
+
+void KVStore::StartWriteWorker() {
+    if (write_worker_.joinable()) {
+        return;
+    }
+    stop_write_worker_ = false;
+    write_worker_ = std::thread(&KVStore::WriteWorkerLoop, this);
+}
+
+void KVStore::StopWriteWorker() {
+    {
+        std::lock_guard<std::mutex> lk(write_queue_mutex_);
+        stop_write_worker_ = true;
+    }
+    write_queue_cv_.notify_all();
+    if (write_worker_.joinable()) {
+        write_worker_.join();
+    }
+}
+
+Status KVStore::ProcessWriteRequest(const WriteRequest& request) {
+    std::lock_guard<std::mutex> append_lock(append_mutex_);
+    for (const auto& op : request.ops) {
+        if (op.key.empty()) {
+            return Status::InvalidArgument("batch op key is empty");
+        }
+        if (op.type == RecordType::kPut) {
+            LogRecord record{RecordType::kPut, static_cast<uint64_t>(std::time(nullptr)), op.key, op.value};
+            IndexEntry entry;
+            Status s = AppendRecord(record, &entry, false);
+            if (!s.ok()) {
+                return s;
+            }
+            std::unique_lock<std::shared_mutex> index_lock(index_mutex_);
+            index_.insert_or_assign(op.key, entry);
+            continue;
+        }
+        if (op.type == RecordType::kDelete) {
+            {
+                std::shared_lock<std::shared_mutex> index_lock(index_mutex_);
+                if (index_.find(op.key) == index_.end()) {
+                    continue;
+                }
+            }
+            LogRecord record{RecordType::kDelete, static_cast<uint64_t>(std::time(nullptr)), op.key, ""};
+            IndexEntry entry;
+            Status s = AppendRecord(record, &entry, false);
+            if (!s.ok()) {
+                return s;
+            }
+            std::unique_lock<std::shared_mutex> index_lock(index_mutex_);
+            index_.erase(op.key);
+            continue;
+        }
+        return Status::InvalidArgument("unknown batch op type");
+    }
+
+    if (options_.sync_on_write && active_file_ != nullptr) {
+        return active_file_->Sync();
+    }
+    return Status::OK();
+}
+
+void KVStore::WriteWorkerLoop() {
+    while (true) {
+        std::vector<WriteRequest> batch;
+        {
+            std::unique_lock<std::mutex> lk(write_queue_mutex_);
+            write_queue_cv_.wait(lk, [this]() { return stop_write_worker_ || !write_queue_.empty(); });
+            if (stop_write_worker_ && write_queue_.empty()) {
+                return;
+            }
+            while (!write_queue_.empty()) {
+                batch.push_back(std::move(write_queue_.front()));
+                write_queue_.pop_front();
+            }
+        }
+
+        for (auto& req : batch) {
+            Status s = ProcessWriteRequest(req);
+            req.done.set_value(s);
+            applied_sequence_.store(req.sequence);
+            applied_sequence_cv_.notify_all();
+        }
+    }
+}
+
 /// @brief 后台工作线程主循环。
 ///
 /// 循环逻辑：
@@ -290,7 +400,7 @@ void KVStore::BackgroundWorkerLoop() {
         if (options_.enable_background_sync &&
             now - last_sync >= std::chrono::milliseconds(options_.background_sync_interval_ms)) {
             std::unique_lock<std::shared_mutex> store_lock(store_mutex_);
-            if (opened_ && active_file_ != nullptr) {
+            if (opened_.load() && active_file_ != nullptr) {
                 (void)active_file_->Sync();
             }
             last_sync = now;
@@ -299,7 +409,7 @@ void KVStore::BackgroundWorkerLoop() {
         if (options_.enable_background_merge &&
             now - last_merge >= std::chrono::milliseconds(options_.background_merge_interval_ms)) {
             std::unique_lock<std::shared_mutex> store_lock(store_mutex_);
-            if (opened_ && data_files_.size() >= options_.background_merge_min_segments) {
+            if (opened_.load() && data_files_.size() >= options_.background_merge_min_segments) {
                 (void)MergeUnlocked();
             }
             last_merge = now;
@@ -341,7 +451,7 @@ std::string KVStore::BuildHintFilePath(uint32_t file_id) const {
 /// @return 成功返回 Status::OK()，失败返回 IOError 或 Corruption。
 Status KVStore::Open() {
     std::unique_lock<std::shared_mutex> lock(store_mutex_);
-    if (opened_) {
+    if (opened_.load()) {
         return Status::OK();
     }
 
@@ -351,6 +461,7 @@ Status KVStore::Open() {
         return Status::IOError("failed to create db directory: " + ec.message());
     }
 
+    std::unique_lock<std::shared_mutex> files_lock(files_mutex_);
     data_files_.clear();
     ordered_file_ids_.clear();
     index_.clear();
@@ -383,7 +494,7 @@ Status KVStore::Open() {
 
     for (uint32_t file_id : ordered_file_ids_) {
         const bool writable = (file_id == active_file_id_);
-        auto data_file = std::make_unique<DataFile>(file_id, BuildDataFilePath(file_id));
+        auto data_file = std::make_shared<DataFile>(file_id, BuildDataFilePath(file_id));
         Status s = data_file->Open(writable);
         if (!s.ok()) {
             return s;
@@ -399,6 +510,7 @@ Status KVStore::Open() {
     if (active_file_ == nullptr) {
         return Status::IOError("active file is null after open");
     }
+    files_lock.unlock();
 
     const bool loaded_from_snapshot = TryLoadIndexSnapshot();
     Status s = loaded_from_snapshot ? Status::OK() : Recover();
@@ -406,7 +518,8 @@ Status KVStore::Open() {
         return s;
     }
 
-    opened_ = true;
+    opened_.store(true);
+    StartWriteWorker();
     StartBackgroundWorker();
     return Status::OK();
 }
@@ -422,12 +535,14 @@ Status KVStore::Open() {
 ///
 /// @return 成功返回 Status::OK()，失败返回 IOError。
 Status KVStore::Close() {
+    StopWriteWorker();
     StopBackgroundWorker();
     std::unique_lock<std::shared_mutex> lock(store_mutex_);
-    if (!opened_ && data_files_.empty()) {
+    if (!opened_.load() && data_files_.empty()) {
         return Status::OK();
     }
 
+    std::unique_lock<std::shared_mutex> files_lock(files_mutex_);
     for (auto& [file_id, file] : data_files_) {
         (void)file_id;
         Status s = file->Close();
@@ -439,7 +554,7 @@ Status KVStore::Close() {
     data_files_.clear();
     ordered_file_ids_.clear();
     active_file_ = nullptr;
-    opened_ = false;
+    opened_.store(false);
     return SaveIndexSnapshot();
 }
 
@@ -748,6 +863,7 @@ Status KVStore::RotateIfNeeded(uint32_t incoming_record_size) {
 ///
 /// @return 成功返回 Status::OK()，失败返回 IOError。
 Status KVStore::RotateActiveFile() {
+    std::unique_lock<std::shared_mutex> files_lock(files_mutex_);
     if (active_file_ == nullptr) {
         return Status::IOError("active file is null");
     }
@@ -758,7 +874,7 @@ Status KVStore::RotateActiveFile() {
     }
 
     ++active_file_id_;
-    auto next = std::make_unique<DataFile>(active_file_id_, BuildDataFilePath(active_file_id_));
+    auto next = std::make_shared<DataFile>(active_file_id_, BuildDataFilePath(active_file_id_));
     s = next->Open(true);
     if (!s.ok()) {
         return s;
@@ -781,7 +897,7 @@ Status KVStore::RotateActiveFile() {
 /// @param record  要追加的逻辑记录（kPut 或 kDelete）。
 /// @param entry   [out] 填充记录位置信息（file_id、offset 等），可为 nullptr。
 /// @return 成功返回 Status::OK()，失败返回 IOError。
-Status KVStore::AppendRecord(const LogRecord& record, IndexEntry* entry) {
+Status KVStore::AppendRecord(const LogRecord& record, IndexEntry* entry, bool sync_immediately) {
     if (!active_file_) {
         return Status::IOError("active file is null");
     }
@@ -799,7 +915,7 @@ Status KVStore::AppendRecord(const LogRecord& record, IndexEntry* entry) {
         return s;
     }
 
-    if (options_.sync_on_write) {
+    if (sync_immediately) {
         s = active_file_->Sync();
         if (!s.ok()) {
             return s;
@@ -834,28 +950,14 @@ Status KVStore::AppendRecord(const LogRecord& record, IndexEntry* entry) {
 /// @param value 对应的值（可为空）。
 /// @return 成功返回 Status::OK()，key 为空返回 InvalidArgument，其他失败返回 IOError。
 Status KVStore::Put(const std::string& key, const std::string& value) {
-    std::unique_lock<std::shared_mutex> lock(store_mutex_);
-    if (!opened_) {
-        return Status::IOError("db not open");
-    }
     if (key.empty()) {
         return Status::InvalidArgument("key is empty");
     }
-
-    LogRecord record;
-    record.type = RecordType::kPut;
-    record.timestamp = static_cast<uint64_t>(std::time(nullptr));
-    record.key = key;
-    record.value = value;
-
-    IndexEntry entry;
-    Status s = AppendRecord(record, &entry);
-    if (!s.ok()) {
-        return s;
-    }
-
-    index_.insert_or_assign(std::move(record.key), entry);
-    return Status::OK();
+    WriteBatchOp op;
+    op.type = RecordType::kPut;
+    op.key = key;
+    op.value = value;
+    return EnqueueWriteRequest({std::move(op)});
 }
 
 /// @brief 读取指定 key 的 value。
@@ -871,20 +973,33 @@ Status KVStore::Put(const std::string& key, const std::string& value) {
 /// @param value [out] 读取到的值写入此处，不得为 nullptr。
 /// @return 成功返回 Status::OK()；key 不存在返回 NotFound；索引指向缺失文件返回 Corruption。
 Status KVStore::Get(const std::string& key, std::string* value) {
-    std::shared_lock<std::shared_mutex> lock(store_mutex_);
-    if (!opened_) {
+    if (!opened_.load()) {
         return Status::IOError("db not open");
     }
     if (value == nullptr) {
         return Status::InvalidArgument("value output is null");
     }
 
-    auto it = index_.find(key);
-    if (it == index_.end()) {
-        return Status::NotFound("key not found");
+    IndexEntry entry;
+    {
+        std::shared_lock<std::shared_mutex> index_lock(index_mutex_);
+        auto it = index_.find(key);
+        if (it == index_.end()) {
+            return Status::NotFound("key not found");
+        }
+        entry = it->second;
     }
 
-    return ReadValueByEntry(it->second, value);
+    return ReadValueByEntry(entry, value);
+}
+
+Status KVStore::GetWithConsistency(const std::string& key,
+                                   std::string* value,
+                                   ReadConsistency consistency) {
+    if (consistency == ReadConsistency::kLinearizable) {
+        WaitForAppliedSequence(enqueued_sequence_.load());
+    }
+    return Get(key, value);
 }
 
 /// @brief 删除指定 key（通过写入 tombstone 记录实现）。
@@ -899,33 +1014,13 @@ Status KVStore::Get(const std::string& key, std::string* value) {
 /// @param key 要删除的键。
 /// @return 成功返回 Status::OK()；key 不存在返回 NotFound；写入失败返回 IOError。
 Status KVStore::Delete(const std::string& key) {
-    std::unique_lock<std::shared_mutex> lock(store_mutex_);
-    if (!opened_) {
-        return Status::IOError("db not open");
-    }
-
     if (key.empty()) {
         return Status::InvalidArgument("key is empty");
     }
-
-    auto it = index_.find(key);
-    if (it == index_.end()) {
-        return Status::OK();
-    }
-
-    LogRecord record;
-    record.type = RecordType::kDelete;
-    record.timestamp = static_cast<uint64_t>(std::time(nullptr));
-    record.key = key;
-
-    IndexEntry entry;
-    Status s = AppendRecord(record, &entry);
-    if (!s.ok()) {
-        return s;
-    }
-
-    index_.erase(key);
-    return Status::OK();
+    WriteBatchOp op;
+    op.type = RecordType::kDelete;
+    op.key = key;
+    return EnqueueWriteRequest({std::move(op)});
 }
 
 /// @brief 以原子方式顺序执行一组 Put/Delete 混合写入操作。
@@ -943,57 +1038,9 @@ Status KVStore::Delete(const std::string& key) {
 /// @return 成功返回 Status::OK()；key 为空或类型非法返回 InvalidArgument；
 ///         I/O 失败返回 IOError。
 Status KVStore::WriteBatch(const std::vector<WriteBatchOp>& ops) {
-    std::unique_lock<std::shared_mutex> lock(store_mutex_);
-    if (!opened_) {
-        return Status::IOError("db not open");
-    }
-
-    for (const auto& op : ops) {
-        if (op.key.empty()) {
-            return Status::InvalidArgument("batch op key is empty");
-        }
-
-        if (op.type == RecordType::kPut) {
-            LogRecord record;
-            record.type = RecordType::kPut;
-            record.timestamp = static_cast<uint64_t>(std::time(nullptr));
-            record.key = op.key;
-            record.value = op.value;
-
-            IndexEntry entry;
-            Status s = AppendRecord(record, &entry);
-            if (!s.ok()) {
-                return s;
-            }
-            index_.insert_or_assign(record.key, entry);
-            continue;
-        }
-
-        if (op.type == RecordType::kDelete) {
-            auto it = index_.find(op.key);
-            if (it == index_.end()) {
-                continue;
-            }
-
-            LogRecord record;
-            record.type = RecordType::kDelete;
-            record.timestamp = static_cast<uint64_t>(std::time(nullptr));
-            record.key = op.key;
-
-            IndexEntry entry;
-            Status s = AppendRecord(record, &entry);
-            if (!s.ok()) {
-                return s;
-            }
-            index_.erase(op.key);
-            continue;
-        }
-
-        return Status::InvalidArgument("unknown batch op type");
-    }
-
-    return Status::OK();
+    return EnqueueWriteRequest(ops);
 }
+
 
 /// @brief 创建一个按 key 升序排列的快照迭代器。
 ///
@@ -1008,8 +1055,7 @@ Status KVStore::WriteBatch(const std::vector<WriteBatchOp>& ops) {
 /// @param iter [out] 创建的迭代器对象写入此处，不得为 nullptr。
 /// @return 成功返回 Status::OK()；iter 为 nullptr 返回 InvalidArgument；读取失败返回相应错误。
 Status KVStore::NewIterator(std::unique_ptr<Iterator>* iter) {
-    std::shared_lock<std::shared_mutex> lock(store_mutex_);
-    if (!opened_) {
+    if (!opened_.load()) {
         return Status::IOError("db not open");
     }
     if (iter == nullptr) {
@@ -1017,9 +1063,12 @@ Status KVStore::NewIterator(std::unique_ptr<Iterator>* iter) {
     }
 
     std::vector<std::pair<std::string, IndexEntry>> entries;
-    entries.reserve(index_.size());
-    for (const auto& [key, entry] : index_) {
-        entries.push_back({key, entry});
+    {
+        std::shared_lock<std::shared_mutex> index_lock(index_mutex_);
+        entries.reserve(index_.size());
+        for (const auto& [key, entry] : index_) {
+            entries.push_back({key, entry});
+        }
     }
     std::sort(entries.begin(),
               entries.end(),
@@ -1057,8 +1106,7 @@ Status KVStore::NewIterator(std::unique_ptr<Iterator>* iter) {
 Status KVStore::Scan(const std::string& prefix,
                      std::size_t limit,
                      std::vector<std::pair<std::string, std::string>>* result) {
-    std::shared_lock<std::shared_mutex> lock(store_mutex_);
-    if (!opened_) {
+    if (!opened_.load()) {
         return Status::IOError("db not open");
     }
     if (result == nullptr) {
@@ -1067,17 +1115,22 @@ Status KVStore::Scan(const std::string& prefix,
 
     result->clear();
     std::vector<std::string> keys;
-    keys.reserve(index_.size());
-    for (const auto& [key, _] : index_) {
-        if (key.rfind(prefix, 0) == 0) {
-            keys.push_back(key);
+    std::unordered_map<std::string, IndexEntry> snapshot;
+    {
+        std::shared_lock<std::shared_mutex> index_lock(index_mutex_);
+        keys.reserve(index_.size());
+        for (const auto& [key, _] : index_) {
+            if (key.rfind(prefix, 0) == 0) {
+                keys.push_back(key);
+            }
         }
+        snapshot = index_;
     }
     std::sort(keys.begin(), keys.end());
 
     for (const auto& key : keys) {
-        auto it = index_.find(key);
-        if (it == index_.end()) {
+        auto it = snapshot.find(key);
+        if (it == snapshot.end()) {
             continue;
         }
         std::string value;
@@ -1104,8 +1157,7 @@ Status KVStore::Scan(const std::string& prefix,
 /// @return 成功遍历全部返回 Status::OK()；fn 为空返回 InvalidArgument；
 ///         fn 返回非 OK 时透传该状态；读取失败返回对应 I/O 错误。
 Status KVStore::Fold(const std::function<Status(const std::string&, const std::string&)>& fn) {
-    std::shared_lock<std::shared_mutex> lock(store_mutex_);
-    if (!opened_) {
+    if (!opened_.load()) {
         return Status::IOError("db not open");
     }
     if (!fn) {
@@ -1113,15 +1165,20 @@ Status KVStore::Fold(const std::function<Status(const std::string&, const std::s
     }
 
     std::vector<std::string> keys;
-    keys.reserve(index_.size());
-    for (const auto& [key, _] : index_) {
-        keys.push_back(key);
+    std::unordered_map<std::string, IndexEntry> snapshot;
+    {
+        std::shared_lock<std::shared_mutex> index_lock(index_mutex_);
+        keys.reserve(index_.size());
+        for (const auto& [key, _] : index_) {
+            keys.push_back(key);
+        }
+        snapshot = index_;
     }
     std::sort(keys.begin(), keys.end());
 
     for (const auto& key : keys) {
-        auto it = index_.find(key);
-        if (it == index_.end()) {
+        auto it = snapshot.find(key);
+        if (it == snapshot.end()) {
             continue;
         }
         std::string value;
@@ -1156,14 +1213,19 @@ Status KVStore::ReadValueByEntry(const IndexEntry& entry, std::string* value) {
         return Status::InvalidArgument("value output is null");
     }
 
-    auto file_it = data_files_.find(entry.file_id);
-    if (file_it == data_files_.end()) {
-        return Status::Corruption("index points to missing data file");
+    std::shared_ptr<DataFile> file;
+    {
+        std::shared_lock<std::shared_mutex> files_lock(files_mutex_);
+        auto file_it = data_files_.find(entry.file_id);
+        if (file_it == data_files_.end()) {
+            return Status::Corruption("index points to missing data file");
+        }
+        file = file_it->second;
     }
 
     LogRecord record;
     uint32_t record_size = 0;
-    Status s = file_it->second->Read(entry.offset, &record, &record_size);
+    Status s = file->Read(entry.offset, &record, &record_size);
     if (!s.ok()) {
         return s;
     }
@@ -1201,7 +1263,9 @@ Status KVStore::Merge() {
 ///
 /// @return 成功返回 Status::OK()，失败返回 IOError 或 Corruption。
 Status KVStore::MergeUnlocked() {
-    if (!opened_) {
+    std::unique_lock<std::shared_mutex> files_lock(files_mutex_);
+    std::unique_lock<std::shared_mutex> index_lock(index_mutex_);
+    if (!opened_.load()) {
         return Status::IOError("db not open");
     }
     if (active_file_ == nullptr) {
@@ -1209,7 +1273,7 @@ Status KVStore::MergeUnlocked() {
     }
 
     const uint32_t merged_file_id = active_file_id_ + 1;
-    auto merged_file = std::make_unique<DataFile>(merged_file_id, BuildDataFilePath(merged_file_id));
+    auto merged_file = std::make_shared<DataFile>(merged_file_id, BuildDataFilePath(merged_file_id));
     Status s = merged_file->Open(true);
     if (!s.ok()) {
         return s;
@@ -1326,7 +1390,7 @@ Status KVStore::MergeUnlocked() {
     ordered_file_ids_.clear();
     active_file_ = nullptr;
 
-    auto reopened_merged = std::make_unique<DataFile>(merged_file_id, BuildDataFilePath(merged_file_id));
+    auto reopened_merged = std::make_shared<DataFile>(merged_file_id, BuildDataFilePath(merged_file_id));
     s = reopened_merged->Open(true);
     if (!s.ok()) {
         return s;

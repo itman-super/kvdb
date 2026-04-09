@@ -35,7 +35,8 @@
 | Index Snapshot | 关闭时持久化 `index.snapshot`，加速冷启动，避免全量扫描 |
 | CRC32 完整性校验 | 每条记录写入时计算并存储 CRC32，读取时校验，防止静默数据损坏 |
 | 崩溃恢复 | 支持截断末尾不完整记录，自动从最后一个完整状态恢复 |
-| 读写锁并发控制 | 读路径使用共享锁，写路径使用独占锁，支持并发读 |
+| 锁分层并发控制 | 分离 `index_mutex` / `append_mutex` / `files_mutex`，读路径先取索引快照后再读文件 |
+| Group Commit | 写请求进入队列由后台 writer 批量追加，`sync_on_write=true` 时按批次 fsync |
 | 可选后台任务线程 | 后台定时 Sync / Merge，可按需开启 |
 | 丰富的操作接口 | `Put` / `Get` / `Delete` / `WriteBatch` / `Scan` / `Fold` / `Iterator` |
 
@@ -77,22 +78,26 @@
     (Merge产出)      (关闭时写出)
 ```
 
-### 写入路径
+### 写入路径（含 Group Commit）
 
 1. 用户调用 `Put(key, value)` 或 `Delete(key)`。
-2. KVStore 持有写锁，构造 `LogRecord`（含时间戳）。
-3. 若活跃文件大小 + 本次记录大小超阈值，自动 `RotateActiveFile()`。
-4. 调用 `DataFile::Append()` 将记录序列化后追加到磁盘。
-5. 若 `sync_on_write == true`，立即调用 `DataFile::Sync()`。
-6. 更新内存索引 `index_[key] = IndexEntry{...}`。
+2. 写入先进入内部队列，由单 writer 线程按批次处理（保证 WAL 顺序）。
+3. writer 线程串行 append：必要时 rotate，再执行 `DataFile::Append()`。
+4. 对同一批次统一执行一次 `Sync()`（当 `sync_on_write == true`）。
+5. 批次内逐条更新内存索引 `index_[key] = IndexEntry{...}`。
 
 ### 读取路径
 
 1. 用户调用 `Get(key, &value)`。
-2. KVStore 持有读锁，在 `index_` 中查找 `key`，获取 `IndexEntry`。
-3. 根据 `IndexEntry.file_id` 定位 `DataFile`，调用 `Read(offset)`。
+2. 先在 `index_mutex` 保护下读取 `IndexEntry` 快照并立即释放索引锁。
+3. 再在 `files_mutex` 保护下取得 `shared_ptr<DataFile>`，释放锁后调用 `Read(offset)`。
 4. DataFile 读取固定头部（25 字节）解析 key/value 大小，再读取 payload，校验 CRC。
 5. 返回 value。
+
+### 一致性语义
+
+- **Read Committed（默认）**：`Get()` 读取已完成 append + 索引更新的最新提交数据。
+- **Linearizable（可选）**：`GetWithConsistency(key, value, ReadConsistency::kLinearizable)` 会先等待已入队写请求完成，再执行读取，确保经过写序列点。
 
 ### 恢复路径（重启时）
 
@@ -539,4 +544,3 @@ cmake --build build
 name = bitcask-cpp
 Get(lang): NotFound: key deleted
 ```
-

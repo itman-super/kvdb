@@ -18,6 +18,7 @@
 #include <io.h>
 #else
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -232,6 +233,24 @@ Status DataFile::Open(bool writable) {
         }
     }
 
+#ifdef _WIN32
+    read_fd_ = _open(file_path_.c_str(), _O_BINARY | _O_RDONLY);
+#else
+    read_fd_ = ::open(file_path_.c_str(), O_RDONLY);
+#endif
+    if (read_fd_ < 0) {
+        if (sync_fd_ >= 0) {
+#ifdef _WIN32
+            _close(sync_fd_);
+#else
+            ::close(sync_fd_);
+#endif
+            sync_fd_ = -1;
+        }
+        file_.close();
+        return Status::IOError("failed to open read fd: " + file_path_);
+    }
+
     return Status::OK();
 }
 
@@ -244,11 +263,19 @@ Status DataFile::Open(bool writable) {
 Status DataFile::Close() {
     std::unique_lock<std::shared_mutex> lock(file_mutex_);
 #ifdef _WIN32
+    if (read_fd_ >= 0) {
+        _close(read_fd_);
+        read_fd_ = -1;
+    }
     if (sync_fd_ >= 0) {
         _close(sync_fd_);
         sync_fd_ = -1;
     }
 #else
+    if (read_fd_ >= 0) {
+        ::close(read_fd_);
+        read_fd_ = -1;
+    }
     if (sync_fd_ >= 0) {
         ::close(sync_fd_);
         sync_fd_ = -1;
@@ -379,21 +406,23 @@ Status DataFile::WriteBytes(const char* data, std::size_t len) {
 /// @param len    需要读取的字节数。
 /// @return 成功返回 Status::OK()，offset 越界返回 OutOfRange，其他失败返回 IOError。
 Status DataFile::ReadBytes(uint64_t offset, char* data, std::size_t len) {
-    std::unique_lock<std::shared_mutex> lock(file_mutex_);
-    if (!file_.is_open()) {
+    std::shared_lock<std::shared_mutex> lock(file_mutex_);
+    if (read_fd_ < 0) {
         return Status::IOError("file not open");
     }
 
-    file_.clear();
-    file_.seekg(0, std::ios::end);
-    if (!file_) {
-        return Status::IOError("seekg end failed");
+#ifdef _WIN32
+    const __int64 file_size = _lseeki64(read_fd_, 0, SEEK_END);
+    if (file_size < 0) {
+        return Status::IOError("seek end failed");
     }
-    std::streamoff end_pos = file_.tellg();
-    if (end_pos < 0) {
-        return Status::IOError("tellg failed");
+#else
+    struct stat st;
+    if (fstat(read_fd_, &st) != 0) {
+        return Status::IOError("fstat failed");
     }
-    const uint64_t file_size = static_cast<uint64_t>(end_pos);
+    const uint64_t file_size = static_cast<uint64_t>(st.st_size);
+#endif
 
     if (offset > file_size) {
         return Status::OutOfRange("offset out of range: " + std::to_string(offset) +
@@ -405,17 +434,17 @@ Status DataFile::ReadBytes(uint64_t offset, char* data, std::size_t len) {
                                   ", file_size: " + std::to_string(file_size));
     }
 
-    file_.clear();
-    file_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
-    if (!file_) {
-        return Status::IOError("seekg failed at offset: " + std::to_string(offset));
+#ifdef _WIN32
+    int got = _pread(read_fd_, data, static_cast<unsigned int>(len), static_cast<__int64>(offset));
+    if (got != static_cast<int>(len)) {
+        return Status::IOError("pread failed");
     }
-
-    file_.read(data, static_cast<std::streamsize>(len));
-    if (file_.gcount() != static_cast<std::streamsize>(len)) {
-        return Status::IOError("read failed, expected: " + std::to_string(len) +
-                               ", got: " + std::to_string(file_.gcount()));
+#else
+    ssize_t got = ::pread(read_fd_, data, len, static_cast<off_t>(offset));
+    if (got != static_cast<ssize_t>(len)) {
+        return Status::IOError("pread failed");
     }
+#endif
 
     return Status::OK();
 }
@@ -571,6 +600,10 @@ Status DataFile::Append(const LogRecord& record, uint64_t* offset, uint32_t* wri
     if (!s.ok()) {
         return s;
     }
+    file_.flush();
+    if (!file_) {
+        return Status::IOError("flush after append failed");
+    }
 
     if (offset != nullptr) {
         *offset = static_cast<uint64_t>(pos);
@@ -705,6 +738,22 @@ Status DataFile::Truncate(uint64_t size) {
             file_.close();
             return Status::IOError("failed to reopen sync fd after truncate");
         }
+    }
+
+    if (read_fd_ >= 0) {
+#ifdef _WIN32
+        _close(read_fd_);
+#else
+        ::close(read_fd_);
+#endif
+    }
+#ifdef _WIN32
+    read_fd_ = _open(file_path_.c_str(), _O_BINARY | _O_RDONLY);
+#else
+    read_fd_ = ::open(file_path_.c_str(), O_RDONLY);
+#endif
+    if (read_fd_ < 0) {
+        return Status::IOError("failed to reopen read fd after truncate");
     }
 
     return Status::OK();
