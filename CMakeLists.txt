@@ -16,6 +16,7 @@ add_executable(kvdb
         src/main.cpp
         src/kv_store.cpp
         src/data_file.cpp
+        src/raft_leader_election.cpp
 )
 
 target_include_directories(kvdb
@@ -33,6 +34,7 @@ add_executable(kvdb_test
         tests/kv_store_test.cpp
         src/kv_store.cpp
         src/data_file.cpp
+        src/raft_leader_election.cpp
 
 )
 
@@ -51,6 +53,7 @@ add_executable(kvdb_bench
         tests/kv_store_benchmark.cpp
         src/kv_store.cpp
         src/data_file.cpp
+        src/raft_leader_election.cpp
 )
 
 target_include_directories(kvdb_bench
@@ -69,6 +72,7 @@ add_executable(kvdb_perf
         tests/kv_store_perf_platform.cpp
         src/kv_store.cpp
         src/data_file.cpp
+        src/raft_leader_election.cpp
 )
 
 target_include_directories(kvdb_perf
@@ -80,4 +84,21 @@ if(MSVC)
     target_compile_options(kvdb_perf PRIVATE /W4)
 else()
     target_compile_options(kvdb_perf PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+
+add_executable(raft_leader_election_test
+        tests/raft_leader_election_test.cpp
+        src/raft_leader_election.cpp
+)
+
+target_include_directories(raft_leader_election_test
+        PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+if(MSVC)
+    target_compile_options(raft_leader_election_test PRIVATE /W4)
+else()
+    target_compile_options(raft_leader_election_test PRIVATE -Wall -Wextra -Wpedantic)
 endif()
