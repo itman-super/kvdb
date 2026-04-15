@@ -17,6 +17,7 @@ add_executable(kvdb
         src/kv_store.cpp
         src/data_file.cpp
         src/raft_leader_election.cpp
+        src/raft_log_replication.cpp
 )
 
 target_include_directories(kvdb
@@ -35,6 +36,7 @@ add_executable(kvdb_test
         src/kv_store.cpp
         src/data_file.cpp
         src/raft_leader_election.cpp
+        src/raft_log_replication.cpp
 
 )
 
@@ -54,6 +56,7 @@ add_executable(kvdb_bench
         src/kv_store.cpp
         src/data_file.cpp
         src/raft_leader_election.cpp
+        src/raft_log_replication.cpp
 )
 
 target_include_directories(kvdb_bench
@@ -73,6 +76,7 @@ add_executable(kvdb_perf
         src/kv_store.cpp
         src/data_file.cpp
         src/raft_leader_election.cpp
+        src/raft_log_replication.cpp
 )
 
 target_include_directories(kvdb_perf
@@ -101,4 +105,20 @@ if(MSVC)
     target_compile_options(raft_leader_election_test PRIVATE /W4)
 else()
     target_compile_options(raft_leader_election_test PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(raft_log_replication_test
+        tests/raft_log_replication_test.cpp
+        src/raft_log_replication.cpp
+)
+
+target_include_directories(raft_log_replication_test
+        PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+if(MSVC)
+    target_compile_options(raft_log_replication_test PRIVATE /W4)
+else()
+    target_compile_options(raft_log_replication_test PRIVATE -Wall -Wextra -Wpedantic)
 endif()

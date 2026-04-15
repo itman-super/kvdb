@@ -132,10 +132,43 @@ void TestAppendEntriesDemotesCandidate() {
     PassTest(__FUNCTION__);
 }
 
+
+void TestSingleNodeElectionBecomesLeaderImmediately() {
+    auto config = MakeConfig(1);
+    config.cluster_size = 1;
+    LeaderElection election(config);
+    election.Start(0);
+
+    auto action = election.Tick(10);
+
+    ASSERT_EQ(action, LeaderElection::TickAction::kSendHeartbeat);
+    ASSERT_EQ(election.state(), LeaderElection::NodeState::kLeader);
+    ASSERT_EQ(election.current_term(), 1u);
+    PassTest(__FUNCTION__);
+}
+
+void TestRejectZeroCandidateIdRequestVote() {
+    LeaderElection election(MakeConfig(1));
+    election.Start(0);
+
+    LeaderElection::RequestVoteRequest request;
+    request.term = 1;
+    request.candidate_id = 0;
+    request.last_log_index = 0;
+    request.last_log_term = 0;
+
+    auto response = election.HandleRequestVote(request, 1);
+    ASSERT_TRUE(!response.vote_granted);
+    ASSERT_TRUE(!election.voted_for().has_value());
+    PassTest(__FUNCTION__);
+}
+
 int main() {
     TestStartElectionOnTimeout();
+    TestSingleNodeElectionBecomesLeaderImmediately();
     TestBecomeLeaderAfterMajorityVotes();
     TestRejectStaleRequestVote();
+    TestRejectZeroCandidateIdRequestVote();
     TestGrantVoteWithUpToDateLog();
     TestAppendEntriesDemotesCandidate();
 
