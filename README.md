@@ -40,6 +40,7 @@
 | 可选后台任务线程 | 后台定时 Sync / Merge，可按需开启 |
 | 丰富的操作接口 | `Put` / `Get` / `Delete` / `WriteBatch` / `Scan` / `Fold` / `Iterator` |
 | Raft 领导者选举模块（新增） | 提供 Follower/Candidate/Leader 状态机、随机选举超时、投票与心跳处理逻辑 |
+| Raft 日志同步模块（新增） | 提供 AppendEntries 日志复制、冲突回退、`nextIndex/matchIndex` 与提交推进逻辑 |
 
 ---
 
@@ -133,17 +134,20 @@ kvdb/
 │   ├── log_record.h        — LogRecord 结构体 + RecordType 枚举
 │   ├── options.h           — Options 配置结构体
 │   ├── status.h            — Status 错误码类
-│   └── raft_leader_election.h — Raft 领导者选举状态机
+│   ├── raft_leader_election.h — Raft 领导者选举状态机
+│   └── raft_log_replication.h — Raft 日志同步状态机
 ├── src/                    — 实现文件
 │   ├── data_file.cpp       — DataFile 实现（编解码、CRC、读写、Sync）
 │   ├── kv_store.cpp        — KVStore 实现（索引、恢复、Merge、后台任务）
 │   ├── raft_leader_election.cpp — Raft 选举状态机实现（任期、投票、心跳）
+│   ├── raft_log_replication.cpp — Raft 日志同步实现（AppendEntries、冲突处理、提交推进）
 │   └── main.cpp            — 最小演示程序
 └── tests/
     ├── kv_store_test.cpp   — 功能、边界、崩溃恢复、完整性测试
     ├── kv_store_benchmark.cpp — Put/Get 吞吐量基准测试
     ├── kv_store_perf_platform.cpp — 可配置性能测试平台（支持 CSV 结果）
-    └── raft_leader_election_test.cpp — Raft 领导者选举状态机测试
+    ├── raft_leader_election_test.cpp — Raft 领导者选举状态机测试
+    └── raft_log_replication_test.cpp — Raft 日志同步状态机测试
 ```
 
 ---

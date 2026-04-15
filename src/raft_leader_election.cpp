@@ -46,8 +46,9 @@ LeaderElection::TickAction LeaderElection::Tick(uint64_t now_ms) {
     granted_votes_.insert(config_.node_id);
     ResetElectionDeadline(now_ms);
 
-    if (granted_votes_.size() > config_.cluster_size / 2) {
+    if (HasMajority(granted_votes_.size())) {
         BecomeLeader(now_ms);
+        return TickAction::kSendHeartbeat;
     }
 
     return TickAction::kStartElection;
@@ -78,6 +79,10 @@ LeaderElection::RequestVoteResponse LeaderElection::HandleRequestVote(const Requ
 
     response.term = current_term_;
 
+    if (request.candidate_id == 0) {
+        return response;
+    }
+
     const bool can_vote_for_candidate = !voted_for_.has_value() || voted_for_.value() == request.candidate_id;
     if (can_vote_for_candidate && IsLogUpToDate(request.last_log_index, request.last_log_term)) {
         voted_for_ = request.candidate_id;
@@ -102,7 +107,7 @@ bool LeaderElection::HandleRequestVoteResponse(uint32_t voter_id,
     }
 
     granted_votes_.insert(voter_id);
-    if (granted_votes_.size() > config_.cluster_size / 2) {
+    if (HasMajority(granted_votes_.size())) {
         BecomeLeader(now_ms);
         return true;
     }
@@ -145,6 +150,11 @@ std::optional<uint32_t> LeaderElection::leader_id() const {
 
 std::optional<uint32_t> LeaderElection::voted_for() const {
     return voted_for_;
+}
+
+
+bool LeaderElection::HasMajority(size_t vote_count) const {
+    return vote_count > config_.cluster_size / 2;
 }
 
 bool LeaderElection::IsLogUpToDate(uint64_t candidate_last_log_index, uint64_t candidate_last_log_term) const {

@@ -72,6 +72,7 @@ public:
     std::optional<uint32_t> voted_for() const;
 
 private:
+    bool HasMajority(size_t vote_count) const;
     bool IsLogUpToDate(uint64_t candidate_last_log_index, uint64_t candidate_last_log_term) const;
     void BecomeFollower(uint64_t new_term, std::optional<uint32_t> known_leader, uint64_t now_ms);
     void BecomeLeader(uint64_t now_ms);
