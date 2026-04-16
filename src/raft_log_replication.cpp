@@ -1,13 +1,20 @@
 #include "raft_log_replication.h"
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 
-RaftLogReplication::RaftLogReplication(uint32_t node_id) : node_id_(node_id) {
+RaftLogReplication::RaftLogReplication(uint32_t node_id, std::string state_file_path)
+    : node_id_(node_id), state_file_path_(std::move(state_file_path)) {
     if (node_id_ == 0) {
         throw std::invalid_argument("node_id must be > 0");
     }
-    Reset();
+    if (!state_file_path_.empty()) {
+        LoadPersistentState();
+    } else {
+        Reset();
+    }
 }
 
 void RaftLogReplication::Reset() {
@@ -15,6 +22,7 @@ void RaftLogReplication::Reset() {
     commit_index_ = 0;
     next_index_.clear();
     match_index_.clear();
+    SavePersistentState();
 }
 
 uint64_t RaftLogReplication::last_log_index() const {
@@ -41,6 +49,7 @@ bool RaftLogReplication::IsLogUpToDate(uint64_t candidate_last_log_index,
 uint64_t RaftLogReplication::AppendLocalEntry(uint64_t current_term, std::string command) {
     const uint64_t next = last_log_index() + 1;
     log_.push_back(LogEntry{next, current_term, std::move(command)});
+    SavePersistentState();
     return next;
 }
 
@@ -55,6 +64,7 @@ void RaftLogReplication::InitLeaderReplication(const std::vector<uint32_t>& peer
         next_index_[peer_id] = start_index;
         match_index_[peer_id] = 0;
     }
+    SavePersistentState();
 }
 
 RaftLogReplication::AppendEntriesRequest RaftLogReplication::BuildAppendEntriesRequest(uint32_t peer_id,
@@ -119,6 +129,7 @@ void RaftLogReplication::HandleAppendEntriesResponse(uint32_t peer_id,
     } else if (next_it->second > 1) {
         --next_it->second;
     }
+    SavePersistentState();
 }
 
 RaftLogReplication::AppendEntriesResponse RaftLogReplication::HandleAppendEntries(
@@ -156,6 +167,7 @@ RaftLogReplication::AppendEntriesResponse RaftLogReplication::HandleAppendEntrie
         commit_index_ = std::min(request.leader_commit, last_log_index());
     }
 
+    SavePersistentState();
     response.success = true;
     response.match_index = (insert_index == 0) ? 0 : (insert_index - 1);
     response.conflict_index = 0;
@@ -200,4 +212,103 @@ uint64_t RaftLogReplication::FindTerm(uint64_t log_index) const {
         return 0;
     }
     return log_[ToVectorPos(log_index)].term;
+}
+
+void RaftLogReplication::LoadPersistentState() {
+    if (state_file_path_.empty()) {
+        return;
+    }
+
+    std::ifstream in(state_file_path_);
+    if (!in.good()) {
+        Reset();
+        return;
+    }
+
+    uint64_t persisted_commit = 0;
+    size_t log_size = 0;
+    if (!(in >> persisted_commit >> log_size)) {
+        Reset();
+        return;
+    }
+
+    std::vector<LogEntry> loaded_log;
+    loaded_log.reserve(log_size);
+    for (size_t i = 0; i < log_size; ++i) {
+        uint64_t index = 0;
+        uint64_t term = 0;
+        std::string command;
+        if (!(in >> index >> term >> std::ws)) {
+            Reset();
+            return;
+        }
+        std::getline(in, command);
+        loaded_log.push_back(LogEntry{index, term, command});
+    }
+
+    size_t next_size = 0;
+    if (!(in >> next_size)) {
+        Reset();
+        return;
+    }
+    std::unordered_map<uint32_t, uint64_t> loaded_next;
+    for (size_t i = 0; i < next_size; ++i) {
+        uint32_t peer = 0;
+        uint64_t value = 0;
+        if (!(in >> peer >> value)) {
+            Reset();
+            return;
+        }
+        loaded_next[peer] = value;
+    }
+
+    size_t match_size = 0;
+    if (!(in >> match_size)) {
+        Reset();
+        return;
+    }
+    std::unordered_map<uint32_t, uint64_t> loaded_match;
+    for (size_t i = 0; i < match_size; ++i) {
+        uint32_t peer = 0;
+        uint64_t value = 0;
+        if (!(in >> peer >> value)) {
+            Reset();
+            return;
+        }
+        loaded_match[peer] = value;
+    }
+
+    log_ = std::move(loaded_log);
+    commit_index_ = std::min(persisted_commit, last_log_index());
+    next_index_ = std::move(loaded_next);
+    match_index_ = std::move(loaded_match);
+}
+
+void RaftLogReplication::SavePersistentState() const {
+    if (state_file_path_.empty()) {
+        return;
+    }
+
+    const std::filesystem::path path(state_file_path_);
+    if (path.has_parent_path()) {
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+    }
+
+    std::ofstream out(state_file_path_, std::ios::trunc);
+    if (!out.good()) {
+        return;
+    }
+    out << commit_index_ << ' ' << log_.size() << '\n';
+    for (const auto& entry : log_) {
+        out << entry.index << ' ' << entry.term << ' ' << entry.command << '\n';
+    }
+    out << next_index_.size() << '\n';
+    for (const auto& [peer, next] : next_index_) {
+        out << peer << ' ' << next << '\n';
+    }
+    out << match_index_.size() << '\n';
+    for (const auto& [peer, match] : match_index_) {
+        out << peer << ' ' << match << '\n';
+    }
 }
