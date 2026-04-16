@@ -31,7 +31,7 @@ public:
         uint64_t conflict_index = 0;
     };
 
-    explicit RaftLogReplication(uint32_t node_id);
+    explicit RaftLogReplication(uint32_t node_id, std::string state_file_path = "");
 
     void Reset();
 
@@ -61,9 +61,12 @@ private:
     size_t ToVectorPos(uint64_t log_index) const;
     uint64_t FindConflictIndex(uint64_t prev_log_index) const;
     uint64_t FindTerm(uint64_t log_index) const;
+    void LoadPersistentState();
+    void SavePersistentState() const;
 
 private:
     uint32_t node_id_;
+    std::string state_file_path_;
     std::vector<LogEntry> log_;
     uint64_t commit_index_ = 0;
 

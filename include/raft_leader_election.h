@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <random>
+#include <string>
 #include <unordered_set>
 
 class LeaderElection {
@@ -20,6 +21,7 @@ public:
         uint64_t max_election_timeout_ms = 300;
         uint64_t heartbeat_interval_ms = 50;
         uint64_t random_seed = 0;
+        std::string state_file_path;
     };
 
     struct RequestVoteRequest {
@@ -78,6 +80,8 @@ private:
     void BecomeLeader(uint64_t now_ms);
     void ResetElectionDeadline(uint64_t now_ms);
     uint64_t RandomizedElectionTimeout();
+    void LoadPersistentState();
+    void SavePersistentState() const;
 
 private:
     Config config_;

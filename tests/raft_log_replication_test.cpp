@@ -1,4 +1,5 @@
 #include <iostream>
+#include <filesystem>
 #include <string>
 
 #include "raft_log_replication.h"
@@ -33,6 +34,12 @@ static int g_failed = 0;
 static void PassTest(const std::string& name) {
     std::cout << "[PASSED] " << name << std::endl;
     ++g_passed;
+}
+
+static std::string MakeStatePath(const std::string& name) {
+    std::filesystem::path dir = std::filesystem::temp_directory_path() / "kvdb_raft_tests";
+    std::filesystem::create_directories(dir);
+    return (dir / name).string();
 }
 
 void TestCompareLogByTermThenIndex() {
@@ -111,11 +118,39 @@ void TestLeaderAdvancesCommitByMajority() {
     PassTest(__FUNCTION__);
 }
 
+void TestReplicationStatePersistence() {
+    const std::string state_path = MakeStatePath("raft_log_replication_state.txt");
+    std::filesystem::remove(state_path);
+
+    {
+        RaftLogReplication node(1, state_path);
+        node.AppendLocalEntry(5, "set x=1");
+        node.AppendLocalEntry(5, "set y=2");
+        node.InitLeaderReplication({1, 2, 3});
+
+        RaftLogReplication::AppendEntriesResponse ok;
+        ok.term = 5;
+        ok.success = true;
+        ok.match_index = 2;
+        node.HandleAppendEntriesResponse(2, ok, 5);
+        ASSERT_EQ(node.commit_index(), 2u);
+    }
+
+    RaftLogReplication recovered(1, state_path);
+    ASSERT_EQ(recovered.last_log_index(), 2u);
+    ASSERT_EQ(recovered.last_log_term(), 5u);
+    ASSERT_EQ(recovered.commit_index(), 2u);
+    ASSERT_TRUE(recovered.GetEntry(2).has_value());
+    ASSERT_EQ(recovered.GetEntry(2)->command, std::string("set y=2"));
+    PassTest(__FUNCTION__);
+}
+
 int main() {
     TestCompareLogByTermThenIndex();
     TestFollowerRejectsMismatchedPrevLog();
     TestFollowerReplacesConflictingEntries();
     TestLeaderAdvancesCommitByMajority();
+    TestReplicationStatePersistence();
 
     std::cout << "\n==== raft_log_replication_test summary ====\n";
     std::cout << "PASSED: " << g_passed << "\n";

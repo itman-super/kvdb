@@ -1,4 +1,5 @@
 #include <iostream>
+#include <filesystem>
 #include <string>
 
 #include "raft_leader_election.h"
@@ -44,6 +45,12 @@ static LeaderElection::Config MakeConfig(uint32_t node_id = 1) {
     config.heartbeat_interval_ms = 5;
     config.random_seed = 7;
     return config;
+}
+
+static std::string MakeStatePath(const std::string& name) {
+    std::filesystem::path dir = std::filesystem::temp_directory_path() / "kvdb_raft_tests";
+    std::filesystem::create_directories(dir);
+    return (dir / name).string();
 }
 
 void TestStartElectionOnTimeout() {
@@ -163,6 +170,37 @@ void TestRejectZeroCandidateIdRequestVote() {
     PassTest(__FUNCTION__);
 }
 
+void TestElectionStatePersistence() {
+    auto config = MakeConfig(1);
+    config.state_file_path = MakeStatePath("leader_election_state.txt");
+    std::filesystem::remove(config.state_file_path);
+
+    {
+        LeaderElection election(config);
+        election.Start(0);
+        ASSERT_EQ(election.Tick(10), LeaderElection::TickAction::kStartElection);
+        ASSERT_EQ(election.current_term(), 1u);
+        ASSERT_TRUE(election.voted_for().has_value());
+        ASSERT_EQ(election.voted_for().value(), 1u);
+        election.UpdateLastLog(8, 3);
+    }
+
+    LeaderElection recovered(config);
+    recovered.Start(20);
+    ASSERT_EQ(recovered.current_term(), 1u);
+    ASSERT_TRUE(recovered.voted_for().has_value());
+    ASSERT_EQ(recovered.voted_for().value(), 1u);
+
+    LeaderElection::RequestVoteRequest stale_candidate;
+    stale_candidate.term = 1;
+    stale_candidate.candidate_id = 2;
+    stale_candidate.last_log_index = 8;
+    stale_candidate.last_log_term = 3;
+    auto response = recovered.HandleRequestVote(stale_candidate, 21);
+    ASSERT_TRUE(!response.vote_granted);
+    PassTest(__FUNCTION__);
+}
+
 int main() {
     TestStartElectionOnTimeout();
     TestSingleNodeElectionBecomesLeaderImmediately();
@@ -171,6 +209,7 @@ int main() {
     TestRejectZeroCandidateIdRequestVote();
     TestGrantVoteWithUpToDateLog();
     TestAppendEntriesDemotesCandidate();
+    TestElectionStatePersistence();
 
     std::cout << "\n==== raft_leader_election_test summary ====\n";
     std::cout << "PASSED: " << g_passed << "\n";
