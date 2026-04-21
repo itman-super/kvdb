@@ -31,6 +31,12 @@ public:
         uint64_t conflict_index = 0;
     };
 
+    struct Snapshot {
+        uint64_t last_included_index = 0;
+        uint64_t last_included_term = 0;
+        std::string data;
+    };
+
     explicit RaftLogReplication(uint32_t node_id, std::string state_file_path = "");
 
     void Reset();
@@ -54,6 +60,12 @@ public:
 
     AppendEntriesResponse HandleAppendEntries(const AppendEntriesRequest& request);
 
+    bool CreateSnapshot(uint64_t last_included_index, std::string snapshot_data);
+    bool InstallSnapshot(const Snapshot& snapshot);
+    bool NeedsSnapshot(uint32_t peer_id) const;
+    std::optional<Snapshot> BuildSnapshotForPeer(uint32_t peer_id) const;
+    std::optional<Snapshot> snapshot() const;
+
     std::optional<LogEntry> GetEntry(uint64_t log_index) const;
     std::vector<LogEntry> GetCommittedEntriesSince(uint64_t last_applied) const;
 
@@ -67,6 +79,7 @@ private:
 private:
     uint32_t node_id_;
     std::string state_file_path_;
+    Snapshot snapshot_;
     std::vector<LogEntry> log_;
     uint64_t commit_index_ = 0;
 
