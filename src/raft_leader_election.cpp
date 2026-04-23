@@ -1,3 +1,10 @@
+// src/raft_leader_election.cpp
+//
+// Raft 领导者选举状态机实现：
+//  - 基于随机选举超时触发 Candidate 竞选；
+//  - 处理 RequestVote / AppendEntries（心跳）；
+//  - 维护 current_term、voted_for、leader_id 等关键状态；
+//  - 可选落盘持久化，支持重启后恢复。
 #include "raft_leader_election.h"
 
 #include <algorithm>
@@ -5,6 +12,7 @@
 #include <fstream>
 #include <stdexcept>
 
+/// @brief 构造选举状态机并校验配置合法性，随后尝试加载持久化状态。
 LeaderElection::LeaderElection(Config config) : config_(config), rng_(config.random_seed) {
     if (config_.cluster_size < 1) {
         throw std::invalid_argument("cluster_size must be >= 1");
@@ -19,6 +27,7 @@ LeaderElection::LeaderElection(Config config) : config_(config), rng_(config.ran
     LoadPersistentState();
 }
 
+/// @brief 启动状态机：恢复或重置运行态，并初始化选举截止时间。
 void LeaderElection::Start(uint64_t now_ms) {
     if (!config_.state_file_path.empty()) {
         LoadPersistentState();
@@ -32,6 +41,7 @@ void LeaderElection::Start(uint64_t now_ms) {
     last_heartbeat_sent_ms_ = now_ms;
 }
 
+/// @brief 推进状态机时钟，判断是否触发新一轮选举或发送心跳。
 LeaderElection::TickAction LeaderElection::Tick(uint64_t now_ms) {
     if (state_ == NodeState::kLeader) {
         if (now_ms >= last_heartbeat_sent_ms_ + config_.heartbeat_interval_ms) {
@@ -62,6 +72,7 @@ LeaderElection::TickAction LeaderElection::Tick(uint64_t now_ms) {
     return TickAction::kStartElection;
 }
 
+/// @brief 生成当前节点用于拉票的 RequestVote 请求。
 LeaderElection::RequestVoteRequest LeaderElection::BuildRequestVoteRequest() const {
     RequestVoteRequest request;
     request.term = current_term_;
@@ -71,6 +82,7 @@ LeaderElection::RequestVoteRequest LeaderElection::BuildRequestVoteRequest() con
     return request;
 }
 
+/// @brief 处理来自候选者的投票请求，按任期和日志新旧规则决定是否投票。
 LeaderElection::RequestVoteResponse LeaderElection::HandleRequestVote(const RequestVoteRequest& request,
                                                                       uint64_t now_ms) {
     RequestVoteResponse response;
@@ -103,6 +115,7 @@ LeaderElection::RequestVoteResponse LeaderElection::HandleRequestVote(const Requ
     return response;
 }
 
+/// @brief 处理投票响应；若达到多数派则切换为 Leader。
 bool LeaderElection::HandleRequestVoteResponse(uint32_t voter_id,
                                                const RequestVoteResponse& response,
                                                uint64_t now_ms) {
@@ -124,6 +137,7 @@ bool LeaderElection::HandleRequestVoteResponse(uint32_t voter_id,
     return false;
 }
 
+/// @brief 处理来自 Leader 的心跳请求；若任期合法则退回 Follower 并确认成功。
 LeaderElection::AppendEntriesResponse LeaderElection::HandleAppendEntries(
     const AppendEntriesRequest& request,
     uint64_t now_ms) {
@@ -141,33 +155,40 @@ LeaderElection::AppendEntriesResponse LeaderElection::HandleAppendEntries(
     return response;
 }
 
+/// @brief 更新本地日志末尾元信息，并持久化到状态文件（若启用）。
 void LeaderElection::UpdateLastLog(uint64_t last_log_index, uint64_t last_log_term) {
     last_log_index_ = last_log_index;
     last_log_term_ = last_log_term;
     SavePersistentState();
 }
 
+/// @brief 返回当前节点角色状态。
 LeaderElection::NodeState LeaderElection::state() const {
     return state_;
 }
 
+/// @brief 返回当前任期号。
 uint64_t LeaderElection::current_term() const {
     return current_term_;
 }
 
+/// @brief 返回当前已知 leader 节点 ID（若存在）。
 std::optional<uint32_t> LeaderElection::leader_id() const {
     return leader_id_;
 }
 
+/// @brief 返回当前任期已投票的候选者 ID（若存在）。
 std::optional<uint32_t> LeaderElection::voted_for() const {
     return voted_for_;
 }
 
 
+/// @brief 判断给定票数是否超过半数门槛。
 bool LeaderElection::HasMajority(size_t vote_count) const {
     return vote_count > config_.cluster_size / 2;
 }
 
+/// @brief 按 Raft 规则比较候选者日志是否“至少一样新”。
 bool LeaderElection::IsLogUpToDate(uint64_t candidate_last_log_index, uint64_t candidate_last_log_term) const {
     if (candidate_last_log_term != last_log_term_) {
         return candidate_last_log_term > last_log_term_;
@@ -175,6 +196,7 @@ bool LeaderElection::IsLogUpToDate(uint64_t candidate_last_log_index, uint64_t c
     return candidate_last_log_index >= last_log_index_;
 }
 
+/// @brief 切换到 Follower，并在必要时更新任期、清理投票状态、刷新超时。
 void LeaderElection::BecomeFollower(uint64_t new_term,
                                     std::optional<uint32_t> known_leader,
                                     uint64_t now_ms) {
@@ -189,6 +211,7 @@ void LeaderElection::BecomeFollower(uint64_t new_term,
     SavePersistentState();
 }
 
+/// @brief 切换到 Leader，记录自身 leader_id 并重置心跳计时。
 void LeaderElection::BecomeLeader(uint64_t now_ms) {
     state_ = NodeState::kLeader;
     leader_id_ = config_.node_id;
@@ -197,16 +220,19 @@ void LeaderElection::BecomeLeader(uint64_t now_ms) {
     SavePersistentState();
 }
 
+/// @brief 按当前时间重设下一次选举超时时刻。
 void LeaderElection::ResetElectionDeadline(uint64_t now_ms) {
     election_deadline_ms_ = now_ms + RandomizedElectionTimeout();
 }
 
+/// @brief 在配置区间 [min, max] 内生成随机选举超时值。
 uint64_t LeaderElection::RandomizedElectionTimeout() {
     std::uniform_int_distribution<uint64_t> dist(config_.min_election_timeout_ms,
                                                   config_.max_election_timeout_ms);
     return dist(rng_);
 }
 
+/// @brief 从状态文件加载持久化状态；读取失败时保持当前内存状态。
 void LeaderElection::LoadPersistentState() {
     if (config_.state_file_path.empty()) {
         return;
@@ -238,6 +264,7 @@ void LeaderElection::LoadPersistentState() {
     last_log_term_ = last_log_term;
 }
 
+/// @brief 将关键状态持久化到文件（覆盖写），供进程重启后恢复。
 void LeaderElection::SavePersistentState() const {
     if (config_.state_file_path.empty()) {
         return;
