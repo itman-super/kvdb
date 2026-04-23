@@ -18,6 +18,7 @@ add_executable(kvdb
         src/data_file.cpp
         src/raft_leader_election.cpp
         src/raft_log_replication.cpp
+        src/raft_distributed_kv.cpp
 )
 
 target_include_directories(kvdb
@@ -37,6 +38,7 @@ add_executable(kvdb_test
         src/data_file.cpp
         src/raft_leader_election.cpp
         src/raft_log_replication.cpp
+        src/raft_distributed_kv.cpp
 
 )
 
@@ -57,6 +59,7 @@ add_executable(kvdb_bench
         src/data_file.cpp
         src/raft_leader_election.cpp
         src/raft_log_replication.cpp
+        src/raft_distributed_kv.cpp
 )
 
 target_include_directories(kvdb_bench
@@ -77,6 +80,7 @@ add_executable(kvdb_perf
         src/data_file.cpp
         src/raft_leader_election.cpp
         src/raft_log_replication.cpp
+        src/raft_distributed_kv.cpp
 )
 
 target_include_directories(kvdb_perf
@@ -121,4 +125,22 @@ if(MSVC)
     target_compile_options(raft_log_replication_test PRIVATE /W4)
 else()
     target_compile_options(raft_log_replication_test PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(raft_distributed_kv_test
+        tests/raft_distributed_kv_test.cpp
+        src/raft_distributed_kv.cpp
+        src/raft_leader_election.cpp
+        src/raft_log_replication.cpp
+)
+
+target_include_directories(raft_distributed_kv_test
+        PRIVATE
+        ${PROJECT_SOURCE_DIR}/include
+)
+
+if(MSVC)
+    target_compile_options(raft_distributed_kv_test PRIVATE /W4)
+else()
+    target_compile_options(raft_distributed_kv_test PRIVATE -Wall -Wextra -Wpedantic)
 endif()
