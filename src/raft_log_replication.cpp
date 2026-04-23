@@ -1,3 +1,10 @@
+// src/raft_log_replication.cpp
+//
+// Raft 日志复制模块实现：
+//  - Leader 侧：构建 AppendEntries、处理响应、推进 commitIndex；
+//  - Follower 侧：校验 prevLog 并执行冲突回退与日志覆盖；
+//  - 快照：支持创建/安装快照以及基于 nextIndex 的快照下发判断；
+//  - 可选持久化：将日志、快照和复制状态保存到本地文件。
 #include "raft_log_replication.h"
 
 #include <algorithm>
@@ -5,6 +12,7 @@
 #include <fstream>
 #include <stdexcept>
 
+/// @brief 构造复制状态机并按需加载持久化状态。
 RaftLogReplication::RaftLogReplication(uint32_t node_id, std::string state_file_path)
     : node_id_(node_id), state_file_path_(std::move(state_file_path)) {
     if (node_id_ == 0) {
@@ -17,6 +25,7 @@ RaftLogReplication::RaftLogReplication(uint32_t node_id, std::string state_file_
     }
 }
 
+/// @brief 将状态机重置为初始状态并持久化。
 void RaftLogReplication::Reset() {
     snapshot_ = Snapshot{};
     log_.clear();
@@ -26,18 +35,22 @@ void RaftLogReplication::Reset() {
     SavePersistentState();
 }
 
+/// @brief 返回本地最后日志索引（日志为空时回退到快照边界）。
 uint64_t RaftLogReplication::last_log_index() const {
     return log_.empty() ? snapshot_.last_included_index : log_.back().index;
 }
 
+/// @brief 返回本地最后日志任期（日志为空时回退到快照边界）。
 uint64_t RaftLogReplication::last_log_term() const {
     return log_.empty() ? snapshot_.last_included_term : log_.back().term;
 }
 
+/// @brief 返回当前提交索引。
 uint64_t RaftLogReplication::commit_index() const {
     return commit_index_;
 }
 
+/// @brief 判断候选者日志是否不落后于本地日志。
 bool RaftLogReplication::IsLogUpToDate(uint64_t candidate_last_log_index,
                                        uint64_t candidate_last_log_term) const {
     const uint64_t local_last_term = last_log_term();
@@ -47,6 +60,7 @@ bool RaftLogReplication::IsLogUpToDate(uint64_t candidate_last_log_index,
     return candidate_last_log_index >= last_log_index();
 }
 
+/// @brief Leader 在本地追加一条新日志并返回其索引。
 uint64_t RaftLogReplication::AppendLocalEntry(uint64_t current_term, std::string command) {
     const uint64_t next = last_log_index() + 1;
     log_.push_back(LogEntry{next, current_term, std::move(command)});
@@ -54,6 +68,7 @@ uint64_t RaftLogReplication::AppendLocalEntry(uint64_t current_term, std::string
     return next;
 }
 
+/// @brief Leader 初始化各 peer 的 nextIndex/matchIndex。
 void RaftLogReplication::InitLeaderReplication(const std::vector<uint32_t>& peer_ids) {
     next_index_.clear();
     match_index_.clear();
@@ -68,6 +83,7 @@ void RaftLogReplication::InitLeaderReplication(const std::vector<uint32_t>& peer
     SavePersistentState();
 }
 
+/// @brief 为指定 peer 构建 AppendEntries 请求，可限制最大 entries 数。
 RaftLogReplication::AppendEntriesRequest RaftLogReplication::BuildAppendEntriesRequest(uint32_t peer_id,
                                                                                         uint64_t current_term,
                                                                                         uint32_t leader_id,
@@ -101,6 +117,7 @@ RaftLogReplication::AppendEntriesRequest RaftLogReplication::BuildAppendEntriesR
     return req;
 }
 
+/// @brief Leader 处理 follower 响应并更新 nextIndex/matchIndex 与 commitIndex。
 void RaftLogReplication::HandleAppendEntriesResponse(uint32_t peer_id,
                                                      const AppendEntriesResponse& response,
                                                      uint64_t current_term) {
@@ -137,6 +154,7 @@ void RaftLogReplication::HandleAppendEntriesResponse(uint32_t peer_id,
     SavePersistentState();
 }
 
+/// @brief Follower 处理 AppendEntries：校验前置日志、冲突覆盖并推进提交点。
 RaftLogReplication::AppendEntriesResponse RaftLogReplication::HandleAppendEntries(
     const AppendEntriesRequest& request) {
     AppendEntriesResponse response;
@@ -184,6 +202,7 @@ RaftLogReplication::AppendEntriesResponse RaftLogReplication::HandleAppendEntrie
     return response;
 }
 
+/// @brief 创建快照并裁剪已包含在快照中的日志条目。
 bool RaftLogReplication::CreateSnapshot(uint64_t last_included_index, std::string snapshot_data) {
     if (last_included_index <= snapshot_.last_included_index || last_included_index > commit_index_) {
         return false;
@@ -206,6 +225,7 @@ bool RaftLogReplication::CreateSnapshot(uint64_t last_included_index, std::strin
     return true;
 }
 
+/// @brief 安装外部快照并丢弃快照点之前的本地日志。
 bool RaftLogReplication::InstallSnapshot(const Snapshot& snapshot) {
     if (snapshot.last_included_index <= snapshot_.last_included_index) {
         return false;
@@ -221,6 +241,7 @@ bool RaftLogReplication::InstallSnapshot(const Snapshot& snapshot) {
     return true;
 }
 
+/// @brief 判断指定 peer 的 nextIndex 是否落后到需要快照补齐。
 bool RaftLogReplication::NeedsSnapshot(uint32_t peer_id) const {
     const auto it = next_index_.find(peer_id);
     if (it == next_index_.end()) {
@@ -229,6 +250,7 @@ bool RaftLogReplication::NeedsSnapshot(uint32_t peer_id) const {
     return it->second <= snapshot_.last_included_index;
 }
 
+/// @brief 若 peer 需要快照则返回当前快照，否则返回 nullopt。
 std::optional<RaftLogReplication::Snapshot> RaftLogReplication::BuildSnapshotForPeer(uint32_t peer_id) const {
     if (!NeedsSnapshot(peer_id)) {
         return std::nullopt;
@@ -236,6 +258,7 @@ std::optional<RaftLogReplication::Snapshot> RaftLogReplication::BuildSnapshotFor
     return snapshot_;
 }
 
+/// @brief 返回当前快照（若尚未创建快照则返回 nullopt）。
 std::optional<RaftLogReplication::Snapshot> RaftLogReplication::snapshot() const {
     if (snapshot_.last_included_index == 0) {
         return std::nullopt;
@@ -243,6 +266,7 @@ std::optional<RaftLogReplication::Snapshot> RaftLogReplication::snapshot() const
     return snapshot_;
 }
 
+/// @brief 按日志索引读取单条日志，不可读时返回 nullopt。
 std::optional<RaftLogReplication::LogEntry> RaftLogReplication::GetEntry(uint64_t log_index) const {
     if (log_index == 0 || log_index <= snapshot_.last_included_index || log_index > last_log_index()) {
         return std::nullopt;
@@ -250,6 +274,7 @@ std::optional<RaftLogReplication::LogEntry> RaftLogReplication::GetEntry(uint64_
     return log_[ToVectorPos(log_index)];
 }
 
+/// @brief 获取已提交但尚未应用的日志区间 (last_applied, commit_index]。
 std::vector<RaftLogReplication::LogEntry> RaftLogReplication::GetCommittedEntriesSince(
     uint64_t last_applied) const {
     std::vector<LogEntry> committed;
@@ -264,10 +289,12 @@ std::vector<RaftLogReplication::LogEntry> RaftLogReplication::GetCommittedEntrie
     return committed;
 }
 
+/// @brief 将逻辑日志索引映射为 log_ 的向量下标。
 size_t RaftLogReplication::ToVectorPos(uint64_t log_index) const {
     return static_cast<size_t>(log_index - snapshot_.last_included_index - 1);
 }
 
+/// @brief 找到冲突任期在本地日志中的起始索引（用于 follower 回退）。
 uint64_t RaftLogReplication::FindConflictIndex(uint64_t prev_log_index) const {
     const uint64_t conflict_term = FindTerm(prev_log_index);
     uint64_t idx = prev_log_index;
@@ -277,6 +304,7 @@ uint64_t RaftLogReplication::FindConflictIndex(uint64_t prev_log_index) const {
     return idx;
 }
 
+/// @brief 查询指定日志索引的任期；索引不可用时返回 0。
 uint64_t RaftLogReplication::FindTerm(uint64_t log_index) const {
     if (log_index == snapshot_.last_included_index) {
         return snapshot_.last_included_term;
@@ -287,6 +315,7 @@ uint64_t RaftLogReplication::FindTerm(uint64_t log_index) const {
     return log_[ToVectorPos(log_index)].term;
 }
 
+/// @brief 从持久化文件加载快照、日志与复制状态；失败时重置状态机。
 void RaftLogReplication::LoadPersistentState() {
     if (state_file_path_.empty()) {
         return;
@@ -370,6 +399,7 @@ void RaftLogReplication::LoadPersistentState() {
     match_index_ = std::move(loaded_match);
 }
 
+/// @brief 将快照、日志与复制状态完整写入持久化文件。
 void RaftLogReplication::SavePersistentState() const {
     if (state_file_path_.empty()) {
         return;

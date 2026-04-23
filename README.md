@@ -8,6 +8,9 @@
 
 ## 目录
 
+- [项目介绍](#项目介绍)
+- [安装指引](#安装指引)
+- [使用说明（快速开始）](#使用说明快速开始)
 - [特性概览](#特性概览)
 - [架构设计](#架构设计)
 - [项目结构](#项目结构)
@@ -20,6 +23,63 @@
 - [测试体系](#测试体系)
 - [基准测试](#基准测试--benchmark)
 - [示例程序](#示例程序)
+
+---
+
+## 项目介绍
+
+`kvdb` 是一个面向学习与实验的 C++17 键值数据库原型，核心目标是用尽量清晰的代码展示 Bitcask 类存储引擎的关键路径：
+
+- 写入路径：append-only WAL + 可选同步策略；
+- 读取路径：内存索引定位 + 按偏移随机读取；
+- 恢复路径：snapshot / hint / 日志扫描三级回退；
+- 空间回收：Merge/Compaction 清理旧版本与墓碑记录。
+
+项目同时包含 Raft 领导者选举与日志复制模块，便于在单仓库内学习存储层与一致性协议的基础实现。
+
+---
+
+## 安装指引
+
+### 1) 环境要求
+
+- C++17 编译器（GCC 9+/Clang 10+/MSVC 2019+）
+- CMake 3.16+
+- Linux/macOS/Windows（代码已包含平台分支）
+
+### 2) 获取源码
+
+```bash
+git clone https://github.com/itman-super/kvdb.git
+cd kvdb
+```
+
+### 3) 编译
+
+```bash
+cmake -S . -B build
+cmake --build build
+```
+
+---
+
+## 使用说明（快速开始）
+
+### 1) 运行最小示例程序
+
+```bash
+./build/bin/kvdb
+```
+
+示例程序会执行：`Open -> Put -> Get -> Delete -> Get -> Close`。
+
+### 2) 运行功能测试
+
+```bash
+./build/bin/kvdb_test
+./build/bin/raft_leader_election_test
+./build/bin/raft_log_replication_test
+```
 
 ---
 
