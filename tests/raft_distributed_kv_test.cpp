@@ -74,10 +74,25 @@ void TestRejectWriteWithoutLeader() {
     PassTest(__FUNCTION__);
 }
 
+
+void TestReadIndexAndJointConsensus() {
+    RaftDistributedKV::NetworkConfig net;
+    net.reorder_responses = true;
+    RaftDistributedKV cluster({1, 2, 3}, net);
+    ASSERT_TRUE(cluster.ElectLeader(1).ok());
+    ASSERT_TRUE(cluster.Put("rk", "v1").ok());
+    std::string value;
+    ASSERT_TRUE(cluster.ReadIndexGet(2, "rk", &value).ok());
+    ASSERT_EQ(value, std::string("v1"));
+    ASSERT_TRUE(cluster.ChangeMembershipJoint({1, 2, 3}).ok());
+    PassTest(__FUNCTION__);
+}
+
 int main() {
     TestElectLeaderAndReplicatePut();
     TestDeleteReplicatedToFollowers();
     TestRejectWriteWithoutLeader();
+    TestReadIndexAndJointConsensus();
 
     std::cout << "\n==== raft_distributed_kv_test summary ====\n";
     std::cout << "PASSED: " << g_passed << "\n";

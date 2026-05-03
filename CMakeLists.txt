@@ -132,6 +132,8 @@ add_executable(raft_distributed_kv_test
         src/raft_distributed_kv.cpp
         src/raft_leader_election.cpp
         src/raft_log_replication.cpp
+        src/kv_store.cpp
+        src/data_file.cpp
 )
 
 target_include_directories(raft_distributed_kv_test
