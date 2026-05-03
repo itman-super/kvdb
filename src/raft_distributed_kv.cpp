@@ -1,13 +1,16 @@
 #include "raft_distributed_kv.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <stdexcept>
 
 namespace {
 constexpr char kDelim = '\t';
 }
 
-RaftDistributedKV::RaftDistributedKV(std::vector<uint32_t> node_ids) {
+RaftDistributedKV::RaftDistributedKV(std::vector<uint32_t> node_ids) : RaftDistributedKV(std::move(node_ids), NetworkConfig{}) {}
+
+RaftDistributedKV::RaftDistributedKV(std::vector<uint32_t> node_ids, NetworkConfig network) : network_(network) {
     if (node_ids.empty()) {
         throw std::invalid_argument("node_ids must not be empty");
     }
@@ -16,11 +19,19 @@ RaftDistributedKV::RaftDistributedKV(std::vector<uint32_t> node_ids) {
 
     const auto cluster_size = static_cast<uint32_t>(node_ids.size());
     nodes_.reserve(node_ids.size());
+    members_.insert(node_ids.begin(), node_ids.end());
     for (uint32_t id : node_ids) {
         if (id == 0) {
             throw std::invalid_argument("node id must be > 0");
         }
         nodes_.emplace_back(id, cluster_size);
+        nodes_.back().data_dir = "/tmp/kvdb_raft_node_" + std::to_string(id);
+        std::filesystem::create_directories(nodes_.back().data_dir);
+        Options opt;
+        opt.db_path = nodes_.back().data_dir;
+        nodes_.back().state_machine = std::make_unique<KVStore>(opt);
+        auto st = nodes_.back().state_machine->Open();
+        if (!st.ok()) { throw std::runtime_error("open node kvstore failed"); }
         nodes_.back().election.Start(now_ms_);
     }
 }
@@ -85,12 +96,7 @@ Status RaftDistributedKV::GetFromNode(uint32_t node_id, const std::string& key, 
     if (node == nullptr) {
         return Status::NotFound("node not found");
     }
-    auto it = node->state_machine.find(key);
-    if (it == node->state_machine.end()) {
-        return Status::NotFound("key not found");
-    }
-    *value = it->second;
-    return Status::OK();
+    return node->state_machine->Get(key, value);
 }
 
 std::optional<uint32_t> RaftDistributedKV::leader_id() const {
@@ -133,9 +139,9 @@ void RaftDistributedKV::ApplyCommittedEntries(Node* node) {
             continue;
         }
         if (is_delete) {
-            node->state_machine.erase(key);
+            (void)node->state_machine->Delete(key);
         } else {
-            node->state_machine[key] = value;
+            (void)node->state_machine->Put(key, value);
         }
         node->last_applied = entry.index;
     }
@@ -148,7 +154,14 @@ Status RaftDistributedKV::ReplicateToFollower(Node* leader, Node* follower) {
 
     const uint64_t term = leader->election.current_term();
     for (int i = 0; i < 64; ++i) {
+        ++rpc_seq_;
+        if (network_.timeout_inject_mod > 0 && rpc_seq_ % network_.timeout_inject_mod == 0) {
+            continue;
+        }
         auto req = leader->replication.BuildAppendEntriesRequest(follower->id, term, leader->id, 16);
+        if (network_.drop_inject_mod > 0 && rpc_seq_ % network_.drop_inject_mod == 0) {
+            continue;
+        }
         auto resp = follower->replication.HandleAppendEntries(req);
         leader->replication.HandleAppendEntriesResponse(follower->id, resp, term);
 
@@ -183,6 +196,86 @@ void RaftDistributedKV::BroadcastHeartbeat(Node* leader) {
         auto resp = follower.replication.HandleAppendEntries(req);
         leader->replication.HandleAppendEntriesResponse(follower.id, resp, term);
     }
+}
+
+
+Status RaftDistributedKV::ReadIndexGet(uint32_t node_id, const std::string& key, std::string* value) {
+    Node* leader = CurrentLeader();
+    if (leader == nullptr) {
+        return Status::IOError("no leader elected");
+    }
+    Status barrier = EnsureReadBarrier(leader);
+    if (!barrier.ok()) {
+        return barrier;
+    }
+    return GetFromNode(node_id, key, value);
+}
+
+bool RaftDistributedKV::MajorityAccepted(const std::unordered_set<uint32_t>& voters,
+                                         const std::unordered_set<uint32_t>& accepted) const {
+    size_t hits = 0;
+    for (uint32_t id : voters) {
+        if (accepted.count(id) != 0) {
+            ++hits;
+        }
+    }
+    return hits * 2 > voters.size();
+}
+
+Status RaftDistributedKV::ChangeMembershipJoint(const std::vector<uint32_t>& new_members) {
+    Node* leader = CurrentLeader();
+    if (leader == nullptr) {
+        return Status::IOError("no leader elected");
+    }
+    if (new_members.empty()) {
+        return Status::InvalidArgument("new_members empty");
+    }
+    joint_old_members_ = members_;
+    joint_new_members_.clear();
+    for (uint32_t id : new_members) {
+        joint_new_members_.insert(id);
+    }
+    std::unordered_set<uint32_t> accepted = {leader->id};
+    for (auto& follower : nodes_) {
+        if (follower.id == leader->id) continue;
+        Status s = ReplicateToFollower(leader, &follower);
+        if (s.ok()) accepted.insert(follower.id);
+    }
+    if (!MajorityAccepted(joint_old_members_, accepted) || !MajorityAccepted(joint_new_members_, accepted)) {
+        return Status::IOError("joint consensus quorum not satisfied");
+    }
+    members_ = joint_new_members_;
+    joint_old_members_.clear();
+    joint_new_members_.clear();
+    return Status::OK();
+}
+
+Status RaftDistributedKV::EnsureReadBarrier(Node* leader) {
+    if (leader == nullptr) {
+        return Status::InvalidArgument("leader is null");
+    }
+    std::unordered_set<uint32_t> accepted = {leader->id};
+    std::deque<uint32_t> delayed;
+    for (auto& follower : nodes_) {
+        if (follower.id == leader->id) continue;
+        ++rpc_seq_;
+        if (network_.timeout_inject_mod > 0 && rpc_seq_ % network_.timeout_inject_mod == 0) {
+            continue;
+        }
+        if (network_.drop_inject_mod > 0 && rpc_seq_ % network_.drop_inject_mod == 0) {
+            continue;
+        }
+        if (network_.reorder_responses) {
+            delayed.push_front(follower.id);
+            continue;
+        }
+        accepted.insert(follower.id);
+    }
+    while (!delayed.empty()) {
+        accepted.insert(delayed.front());
+        delayed.pop_front();
+    }
+    return MajorityAccepted(members_, accepted) ? Status::OK() : Status::IOError("read index quorum failed");
 }
 
 std::string RaftDistributedKV::EncodePut(const std::string& key, const std::string& value) {

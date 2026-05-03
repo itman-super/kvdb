@@ -178,3 +178,19 @@ Raft 日志会持续增长；如果不压缩：
 3. 增加快照与 InstallSnapshot RPC。
 4. 把选举模块与日志模块整合为统一 `RaftNode`，减少外层协调复杂度。
 5. 增加网络故障注入测试（乱序、重复、分区、延迟）验证安全性与活性。
+
+## 本轮增强：网络抽象、真实状态机、ReadIndex、Joint Consensus
+
+- **网络抽象层（教学版）**：在 `RaftDistributedKV::NetworkConfig` 中新增三类注入能力：
+  - `timeout_inject_mod`：按 RPC 序号周期性模拟超时；
+  - `drop_inject_mod`：按 RPC 序号周期性模拟丢包；
+  - `reorder_responses`：对响应做延迟队列重排，模拟乱序可见性。
+- **状态机切换为真实 KVStore**：每个节点从原先内存 `unordered_map` 改为独立 `KVStore` 实例，数据落到各自目录（`/tmp/kvdb_raft_node_<id>`），Apply 阶段通过 `Put/Delete` 写盘。
+- **ReadIndex 线性一致读**：新增 `ReadIndexGet`，先经由 `EnsureReadBarrier` 与多数派完成一次读屏障，再读取节点状态机，近似体现“读前确认当前 leader 仍具法定多数”。
+- **Joint Consensus 成员变更（简化实现）**：新增 `ChangeMembershipJoint`：
+  1. 进入 `old,new` 联合配置；
+  2. 统计复制成功节点集合；
+  3. 同时满足 old/new 两侧多数派才提交；
+  4. 收敛到新配置。
+
+> 说明：以上是偏教学的最小闭环实现，用于帮助理解机制；未覆盖生产级网络时钟、重试预算、持久化配置项、快照安装驱动下的成员变更边界条件。
